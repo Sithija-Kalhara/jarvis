@@ -1,0 +1,15 @@
+SpeechRecognition
+pyttsx3
+pyautogui
+pygetwindow
+Pillow
+psutil
+ollama
+sounddevice
+flask
+flask-socketio
+eventlet
+pycaw
+comtypes
+pyinstaller
+keyboard
