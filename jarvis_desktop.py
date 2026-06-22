@@ -295,15 +295,6 @@ class PCManager:
         except Exception:
             return f"Cannot open '{name}'."
 
-    def search_web(self, query):
-        webbrowser.open(f"https://www.google.com/search?q={query.replace(' ', '+')}")
-        return f"Searching for: {query}"
-
-    def take_screenshot(self):
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = str(Path.home() / "Desktop" / f"jarvis_{ts}.png")
-        ImageGrab.grab().save(path)
-        return f"Screenshot saved to Desktop."
 
     def get_system_info(self):
         cpu  = psutil.cpu_percent(interval=0.5)
@@ -503,7 +494,7 @@ class JARVISApp:
         self.brain  = AIBrain(self.memory)
         self.mic    = MicManager()
 
-        self._log("[ sys ] J.A.R.V.I.S. v3.0 initialising...")
+        self._log("[ sys ] JARVIS v3.0 initialising...")
         self.set_mode("idle", "Starting up…")
 
         # Start mic in background after UI is ready
@@ -516,7 +507,7 @@ class JARVISApp:
         top = tk.Frame(self.root, bg=DARK, height=44)
         top.pack(fill="x", padx=12, pady=(10, 0))
 
-        tk.Label(top, text="J.A.R.V.I.S.", font=("Consolas", 15, "bold"),
+        tk.Label(top, text="JARVIS", font=("Consolas", 15, "bold"),
                  fg=BLUE, bg=DARK).pack(side="left")
         tk.Label(top, text="  /  v3.0  /  LOCAL AI SYSTEM",
                  font=("Consolas", 9), fg=BLUE2, bg=DARK).pack(side="left")
@@ -855,7 +846,7 @@ class JARVISApp:
             self.mic.start_wake_loop(self._on_wake)
             self._log(f'[ mic ] Listening for "{WAKE_WORD.upper()}"')
             self.set_mode("idle", f'Say  "{WAKE_WORD}"  to activate')
-            self.tts.speak("J.A.R.V.I.S. online. How can I assist, sir?")
+            self.tts.speak("JARVIS online. How can I assist, sir?")
         except Exception as e:
             self._log(f"[ mic ] ERROR: {e}")
             self.set_mode("idle", "Mic error — use text input below")
@@ -938,7 +929,7 @@ def check_ollama():
 if __name__ == "__main__":
     print("""
 ╔══════════════════════════════════════════════════════════════╗
-║        J.A.R.V.I.S.  Desktop  v3.0                         ║
+║        JARVIS  Desktop  v3.0                         ║
 ║   Pure Tkinter | No Browser | No Ports | Python 3.14 Safe   ║
 ╚══════════════════════════════════════════════════════════════╝
 """)

@@ -26,14 +26,11 @@ warnings.filterwarnings("ignore")
 
 # ── Try best available mic backend ────────────────────────────
 # sounddevice works on Python 3.14; pyaudio is fallback
-try:
-    import sounddevice as sd
-    import numpy as np
-    MIC_BACKEND = "sounddevice"
-except ImportError:
-    MIC_BACKEND = "pyaudio"
-
+# ── Mic: sounddevice only (no PyAudio needed) ─────────────────
+import sounddevice as sd
+import numpy as np
 import speech_recognition as sr
+MIC_BACKEND = "sounddevice"  # PyAudio completely removed
 
 # ── Tkinter ────────────────────────────────────────────────────
 import tkinter as tk
@@ -155,39 +152,73 @@ class AppManager:
     }
 
     def open(self, name: str) -> str:
+        import shutil as _sh
         key = name.lower().strip()
         target = self.APP_MAP.get(key)
 
         if not target:
-            # Fuzzy match
             for k, v in self.APP_MAP.items():
                 if key in k or k in key:
                     target = v
                     break
 
         if target:
-            # URL → open in browser
             if target.startswith("http"):
-                webbrowser.open(target)
+                webbrowser.open_new_tab(target)
                 return f"Opening {name} in browser."
 
-            # ms-settings: URI
             if target.startswith("ms-settings:"):
                 subprocess.Popen(f"start {target}", shell=True)
                 return f"Opening {name} settings."
 
-            # .msc files
             if target.endswith(".msc"):
                 subprocess.Popen(f"mmc.exe {target}", shell=True)
                 return f"Opening {name}."
 
+            # 1. Check PATH first
+            found = _sh.which(target)
+            if found:
+                subprocess.Popen([found])
+                return f"Opening {name}."
+
+            # 2. Search common install locations
+            lad  = os.environ.get("LOCALAPPDATA", "")
+            rad  = os.environ.get("APPDATA", "")
+            pf   = os.environ.get("PROGRAMFILES", "")
+            pf86 = os.environ.get("ProgramFiles(x86)", "")
+            prof = os.environ.get("USERPROFILE", "")
+            search_bases = [b for b in [
+                os.path.join(lad, "Programs"),
+                os.path.join(lad, "Discord"),
+                os.path.join(rad, "Spotify"),
+                os.path.join(rad, "Telegram Desktop"),
+                pf, pf86,
+                os.path.join(prof, "AppData", "Local", "Programs"),
+            ] if b and os.path.exists(b)]
+
+            for base in search_bases:
+                try:
+                    for root, dirs, files in os.walk(base):
+                        if root.replace(base, "").count(os.sep) > 3:
+                            dirs.clear()
+                            continue
+                        for f in files:
+                            if f.lower() == target.lower():
+                                full = os.path.join(root, f)
+                                print(f"   Found: {full}")
+                                subprocess.Popen([full])
+                                return f"Opening {name}."
+                except Exception:
+                    continue
+
+            # 3. Shell fallback
             try:
                 subprocess.Popen(target, shell=True)
                 return f"Opening {name}."
-            except Exception as e:
-                return f"Error opening {name}: {e}"
+            except Exception:
+                pass
 
-        # Last resort: Windows search
+        # 4. Windows Start Menu search
         try:
             if HAS_PYAUTOGUI:
                 pyautogui.hotkey("win", "s")
@@ -198,7 +229,8 @@ class AppManager:
                 return f"Searching Windows for '{name}'."
         except Exception:
             pass
-        return f"Cannot find '{name}'. Try installing it first."
+        return f"Cannot find '{name}'."
+
 
     def close(self, name: str) -> str:
         """Close app by name — tries window title first, then process name."""
@@ -409,47 +441,32 @@ class SystemControl:
     # ── Volume ────────────────────────────────────────────────
     def set_volume(self, level: int) -> str:
         level = max(0, min(100, int(level)))
+        # Method 1: PowerShell nircmd (if installed)
         try:
-            # Use PowerShell — works without nircmd
-            ps = (
-                f"$vol = New-Object -ComObject WScript.Shell; "
-                f"1..50 | ForEach-Object {{ $vol.SendKeys([char]174) }}; "   # mute all
-                f"$steps = [math]::Round({level} / 2); "
-                f"1..$steps | ForEach-Object {{ $vol.SendKeys([char]175) }}"  # vol up
-            )
-            # Better: use pycaw if available, else nircmd, else keypress
-            try:
-                from ctypes import cast, POINTER
-                from comtypes import CLSCTX_ALL
-                from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-                devices = AudioUtilities.GetSpeakers()
-                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-                volume = cast(interface, POINTER(IAudioEndpointVolume))
-                volume.SetMasterVolumeLevelScalar(level / 100, None)
-                return f"Volume set to {level}%."
-            except ImportError:
-                pass
-
-            # Fallback: nircmd
-            result = subprocess.run(
+            r = subprocess.run(
                 f"nircmd.exe setsysvolume {int(level/100*65535)}",
                 shell=True, capture_output=True, timeout=3
             )
-            if result.returncode == 0:
+            if r.returncode == 0:
                 return f"Volume set to {level}%."
-
-            # Fallback: PowerShell key simulation
-            if HAS_PYAUTOGUI:
-                # Reset to 0 then go up
-                for _ in range(50):
-                    pyautogui.press("volumedown")
-                steps = int(level / 2)
-                for _ in range(steps):
-                    pyautogui.press("volumeup")
-                return f"Volume set to approximately {level}%."
-            return "Volume control: install pycaw → pip install pycaw"
-        except Exception as e:
-            return f"Volume error: {e}"
+        except Exception:
+            pass
+        # Method 2: PowerShell
+        try:
+            ps = (f"$obj=New-Object -ComObject WScript.Shell;"
+                  f"1..50|%{{$obj.SendKeys([char]174)}};"
+                  f"1..{int(level/2)}|%{{$obj.SendKeys([char]175)}}")
+            subprocess.run(["powershell","-Command",ps],
+                           capture_output=True, timeout=8)
+            return f"Volume set to ~{level}%."
+        except Exception:
+            pass
+        # Method 3: pyautogui keys
+        if HAS_PYAUTOGUI:
+            for _ in range(50): pyautogui.press("volumedown")
+            for _ in range(int(level/2)): pyautogui.press("volumeup")
+            return f"Volume set to ~{level}%."
+        return "Volume control unavailable."
 
     def volume_up(self) -> str:
         if HAS_PYAUTOGUI:
@@ -731,7 +748,7 @@ class BrowserControl:
     def open_url(self, url: str) -> str:
         if not url.startswith("http"):
             url = "https://" + url
-        webbrowser.open(url)
+        webbrowser.open_new_tab(url)
         return f"Opened: {url}"
 
     def search(self, query: str, engine: str = "google") -> str:
@@ -744,7 +761,7 @@ class BrowserControl:
             "bing":      f"https://www.bing.com/search?q={query.replace(' ', '+')}",
         }
         url = engines.get(engine.lower(), engines["google"])
-        webbrowser.open(url)
+        webbrowser.open_new_tab(url)
         return f"Searching '{query}' on {engine}."
 
     def new_tab(self) -> str:
@@ -1006,30 +1023,7 @@ class CommandParser:
         return None  # Not a PC command → pass to AI
 
 
-# ══════════════════════════════════════════════════════════════
-# QUICK SELF-TEST
-# ══════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    print("Testing PC Control Module...")
-    parser = CommandParser()
-
-    tests = [
-        "open chrome",
-        "what's running",
-        "volume up",
-        "set volume to 50",
-        "system status",
-        "take a screenshot",
-        "search for python tutorials",
-        "open youtube",
-        "what is my ip",
-        "close notepad",
-    ]
-
-    for t in tests:
-        result = parser.parse(t)
-        print(f"  [{t}] → {result}")
+# (self-test removed)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1130,111 +1124,1242 @@ class TTSEngine:
 
 class MicManager:
     """
-    Uses sounddevice if available (Python 3.14 safe).
-    Falls back to pyaudio via speech_recognition.
+    Windows-native mic using sounddevice WASAPI.
+    No PyAudio. No VAD complexity.
+    Records fixed chunks → Google STT → wake word detect.
     """
 
+    FS      = 16000
+    DEVICE  = None   # set in __init__
+
     def __init__(self, on_audio_level=None):
-        self.recognizer = sr.Recognizer()
-        self.recognizer.energy_threshold = ENERGY_THRESH
-        self.recognizer.dynamic_energy_threshold = True
-        self.recognizer.pause_threshold = 0.6
-        self.recognizer.phrase_threshold = 0.3
-        self.recognizer.non_speaking_duration = 0.5
-        self.on_audio_level = on_audio_level  # callback(float 0-1)
-        self._backend = MIC_BACKEND
-        print(f"🎤 Mic backend: {self._backend}")
+        self.on_audio_level   = on_audio_level
+        self._mic_active      = False
+        self._wake_processing = False
+        self._recognizer      = sr.Recognizer()
+        self._recognizer.energy_threshold        = 300
+        self._recognizer.dynamic_energy_threshold = True
 
-        if self._backend == "sounddevice":
-            self._calibrate_sd()
-        else:
-            self._calibrate_pyaudio()
+        print("🎤 Mic: sounddevice (PyAudio-free)")
+        self._select_device()
+        self._calibrate()
 
-    def _calibrate_sd(self):
-        print("🔧 Calibrating mic (sounddevice)...")
+    def _select_device(self):
+        """Pick best input device — prefer WH-1000XM4 WASAPI."""
         try:
-            mic = sr.Microphone()
-            with mic as src:
-                self.recognizer.adjust_for_ambient_noise(src, duration=2)
-            print(f"✅ Threshold: {self.recognizer.energy_threshold:.0f}")
+            devices = sd.query_devices()
+            hostapis = sd.query_hostapis()
+
+            best = None
+            best_score = -1
+
+            for i, d in enumerate(devices):
+                if d['max_input_channels'] < 1:
+                    continue
+                name = d['name'].lower()
+                ha   = hostapis[d['hostapi']]['name'].lower() if d['hostapi'] < len(hostapis) else ''
+                score = 0
+                if 'wh-1000' in name:   score += 10
+                if 'headset' in name:    score += 5
+                if 'wasapi' in ha:       score += 3
+                if 'surface' in name:    score += 2
+                if score > best_score:
+                    best_score = score
+                    best = i
+
+            self.DEVICE = best if best is not None else sd.default.device[0]
+            info = sd.query_devices(self.DEVICE)
+            self.NATIVE_FS = int(info['default_samplerate'])
+            print(f"✅ Mic: [{self.DEVICE}] {info['name']} @ {self.NATIVE_FS}Hz")
         except Exception as e:
-            print(f"⚠️ Calibration warning: {e}")
+            print(f"⚠️  Device select error: {e}")
+            self.DEVICE    = None
+            self.NATIVE_FS = 16000
 
-    def _calibrate_pyaudio(self):
-        print("🔧 Calibrating mic (pyaudio)...")
+    def _calibrate(self):
+        print("   Calibrating (2 sec, stay quiet)...")
         try:
-            mic = sr.Microphone()
-            with mic as src:
-                self.recognizer.adjust_for_ambient_noise(src, duration=2)
-            print(f"✅ Threshold: {self.recognizer.energy_threshold:.0f}")
+            samples = sd.rec(int(self.NATIVE_FS * 2),
+                             samplerate=self.NATIVE_FS,
+                             channels=1, dtype='int16',
+                             device=self.DEVICE)
+            sd.wait()
+            rms = float(np.sqrt(np.mean(samples.astype(np.float32)**2)))
+            self._speech_rms  = max(80,  int(rms * 3.5))
+            self._silence_rms = max(25,  int(rms * 1.2))
+            print(f"   Ambient:{rms:.0f} | speak>{self._speech_rms} | silence<{self._silence_rms}")
+            print(f"   ✅ Ready — say '{WAKE_WORD}' to activate")
         except Exception as e:
-            print(f"⚠️ Calibration warning: {e}")
+            print(f"⚠️  Calibration skipped: {e}")
+            self._speech_rms  = 200
+            self._silence_rms = 60
 
-    def listen_once(self, timeout=3, phrase_limit=10):
-        """Blocking listen, returns text or None."""
+    def _record_phrase(self, wait_sec=20, max_sec=8):
+        """
+        Wait for speech, record full phrase, return resampled 16kHz WAV bytes.
+        Simple and reliable: 100ms chunks, VAD start/stop.
+        """
+        import io, wave as wav_module
+
+        chunk_sec   = 0.1
+        chunk_samp  = int(self.NATIVE_FS * chunk_sec)
+        wait_max    = int(wait_sec / chunk_sec)
+        rec_max     = int(max_sec  / chunk_sec)
+        silence_pad = 12   # 1.2 sec silence → stop
+
+        frames        = []
+        in_speech     = False
+        silence_count = 0
+        waited        = 0
+
+        while True:
+            try:
+                data = sd.rec(chunk_samp, samplerate=self.NATIVE_FS,
+                              channels=1, dtype='int16', device=self.DEVICE)
+                sd.wait()
+            except Exception:
+                time.sleep(0.1)
+                continue
+
+            rms = float(np.sqrt(np.mean(data.astype(np.float32)**2)))
+
+            if not in_speech:
+                if rms >= self._speech_rms:
+                    in_speech = True
+                    frames.append(data.copy())
+                else:
+                    waited += 1
+                    if waited >= wait_max:
+                        return None   # nobody spoke
+            else:
+                frames.append(data.copy())
+                silence_count = silence_count + 1 if rms < self._silence_rms else 0
+                if silence_count >= silence_pad:
+                    break
+                if len(frames) >= rec_max:
+                    break
+
+        if len(frames) < 4:   # < 0.4 sec — too short
+            return None
+
+        # Concatenate and resample to 16kHz
+        audio = np.concatenate(frames, axis=0).flatten().astype(np.float32)
+        if self.NATIVE_FS != self.FS:
+            ratio   = self.FS / self.NATIVE_FS
+            new_len = int(len(audio) * ratio)
+            audio   = np.interp(
+                np.linspace(0, len(audio)-1, new_len),
+                np.arange(len(audio)),
+                audio
+            )
+        audio_i16 = np.clip(audio, -32768, 32767).astype(np.int16)
+
+        buf = io.BytesIO()
+        with wav_module.open(buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.FS)
+            wf.writeframes(audio_i16.tobytes())
+        buf.seek(0)
+        return buf
+
+    def _buf_to_text(self, buf):
+        """Send WAV buffer to Google STT. Returns text or None."""
         try:
-            mic = sr.Microphone()
-            with mic as src:
-                self.recognizer.adjust_for_ambient_noise(src, duration=0.3)
-                audio = self.recognizer.listen(src, timeout=timeout,
-                                               phrase_time_limit=phrase_limit)
-            text = self.recognizer.recognize_google(audio, language="en-US")
-            return text
-        except (sr.WaitTimeoutError, sr.UnknownValueError):
+            af = sr.AudioFile(buf)
+            with af as src:
+                audio_data = self._recognizer.record(src)
+            return self._recognizer.recognize_google(audio_data, language="en-US")
+        except sr.UnknownValueError:
             return None
         except sr.RequestError as e:
-            print(f"   Speech API error: {e}")
+            print(f"   STT error: {e}")
             return None
         except Exception as e:
-            print(f"   Mic error: {e}")
+            print(f"   STT error: {e}")
             return None
 
+    def listen_once(self, timeout=5, phrase_limit=10):
+        """Blocking listen for one phrase. Returns text or None."""
+        print("   🎤 Listening...", end="", flush=True)
+        buf = self._record_phrase(wait_sec=timeout, max_sec=phrase_limit)
+        if not buf:
+            print(" (nothing)")
+            return None
+        print(" processing...")
+        return self._buf_to_text(buf)
+
     def start_wake_loop(self, on_wake):
-        """Background thread that fires on_wake(command) when wake word heard."""
+        """Background thread — always listening for wake word."""
+        self._wake_processing = False
+        self._mic_active      = False
+
         def _loop():
-            rec = sr.Recognizer()
-            rec.energy_threshold = ENERGY_THRESH
-            rec.dynamic_energy_threshold = True
-            rec.pause_threshold = 0.5
-            rec.phrase_threshold = 0.3
-            rec.non_speaking_duration = 0.4
-
-            try:
-                mic = sr.Microphone()
-            except Exception as e:
-                print(f"❌ Cannot open microphone: {e}")
-                print("   Make sure a microphone is connected.")
-                return
-
-            try:
-                with mic as src:
-                    rec.adjust_for_ambient_noise(src, duration=1)
-                print(f"🎙️ Wake-word listener active. Say '{WAKE_WORD.upper()}'")
-            except Exception as e:
-                print(f"⚠️ Mic calibration issue: {e}")
-
+            print(f"🎙️ Always listening for '{WAKE_WORD.upper()}'...")
             while True:
                 try:
-                    with mic as src:
-                        audio = rec.listen(src, timeout=2, phrase_time_limit=8)
-                    try:
-                        text = rec.recognize_google(audio, language="en-US")
-                        lower = text.lower()
-                        if WAKE_WORD in lower:
-                            idx = lower.find(WAKE_WORD)
-                            cmd = text[idx + len(WAKE_WORD):].strip(" ,.")
-                            on_wake(cmd)
-                    except (sr.UnknownValueError, sr.RequestError):
-                        pass
-                except sr.WaitTimeoutError:
-                    pass
+                    self._mic_active = True
+                    buf = self._record_phrase(wait_sec=999, max_sec=8)
+                    self._mic_active = False
+
+                    if not buf:
+                        continue
+
+                    text = self._buf_to_text(buf)
+                    if not text:
+                        continue
+
+                    print(f"👂 Heard: {text}")
+                    low = text.lower()
+
+                    if WAKE_WORD in low and not self._wake_processing:
+                        self._wake_processing = True
+
+                        # Extract command after wake word
+                        idx = low.find(WAKE_WORD)
+                        cmd = text[idx + len(WAKE_WORD):].strip(" ,.")
+
+                        # Remove duplicate words
+                        parts = cmd.split()
+                        dedup = []
+                        for w in parts:
+                            if not dedup or w.lower() != dedup[-1].lower():
+                                dedup.append(w)
+                        cmd = " ".join(dedup).strip()
+
+                        print(f"   ▶ Command: '{cmd}'")
+                        on_wake(cmd)
+
+                        time.sleep(1.0)   # debounce
+                        self._wake_processing = False
+
                 except Exception as e:
+                    self._mic_active = False
+                    print(f"   mic loop error: {e}")
                     time.sleep(0.5)
 
         threading.Thread(target=_loop, daemon=True).start()
 
+
+class AppManager:
+
+    # Common apps — easily extendable
+    APP_MAP = {
+        # Browsers
+        "chrome":           "chrome.exe",
+        "google chrome":    "chrome.exe",
+        "firefox":          "firefox.exe",
+        "edge":             "msedge.exe",
+        "microsoft edge":   "msedge.exe",
+        "opera":            "opera.exe",
+        "brave":            "brave.exe",
+
+        # Microsoft Office
+        "word":             "winword.exe",
+        "excel":            "excel.exe",
+        "powerpoint":       "powerpnt.exe",
+        "outlook":          "outlook.exe",
+        "onenote":          "onenote.exe",
+        "teams":            "teams.exe",
+
+        # System tools
+        "notepad":          "notepad.exe",
+        "notepad++":        "notepad++.exe",
+        "calculator":       "calc.exe",
+        "calc":             "calc.exe",
+        "paint":            "mspaint.exe",
+        "cmd":              "cmd.exe",
+        "command prompt":   "cmd.exe",
+        "terminal":         "wt.exe",
+        "windows terminal": "wt.exe",
+        "powershell":       "powershell.exe",
+        "task manager":     "taskmgr.exe",
+        "file explorer":    "explorer.exe",
+        "explorer":         "explorer.exe",
+        "control panel":    "control.exe",
+        "registry":         "regedit.exe",
+        "device manager":   "devmgmt.msc",
+        "disk management":  "diskmgmt.msc",
+        "event viewer":     "eventvwr.msc",
+        "services":         "services.msc",
+        "snipping tool":    "snippingtool.exe",
+        "snip":             "snippingtool.exe",
+        "screen recorder":  "xbox",
+
+        # Settings
+        "settings":         "ms-settings:",
+        "wifi settings":    "ms-settings:network-wifi",
+        "bluetooth":        "ms-settings:bluetooth",
+        "display settings": "ms-settings:display",
+        "sound settings":   "ms-settings:sound",
+        "privacy":          "ms-settings:privacy",
+        "update":           "ms-settings:windowsupdate",
+
+        # Media / Entertainment
+        "spotify":          "spotify.exe",
+        "vlc":              "vlc.exe",
+        "media player":     "wmplayer.exe",
+        "netflix":          "https://www.netflix.com",
+        "youtube":          "https://www.youtube.com",
+
+        # Dev tools
+        "vscode":           "code.exe",
+        "vs code":          "code.exe",
+        "visual studio":    "devenv.exe",
+        "git bash":         "git-bash.exe",
+        "android studio":   "studio64.exe",
+        "pycharm":          "pycharm64.exe",
+
+        # Communication
+        "discord":          "discord.exe",
+        "slack":            "slack.exe",
+        "zoom":             "zoom.exe",
+        "skype":            "skype.exe",
+        "whatsapp":         "whatsapp.exe",
+        "telegram":         "telegram.exe",
+
+        # Utilities
+        "7zip":             "7zFM.exe",
+        "winrar":           "winrar.exe",
+        "obs":              "obs64.exe",
+        "steam":            "steam.exe",
+        "epic games":       "EpicGamesLauncher.exe",
+    }
+
+    def open(self, name: str) -> str:
+        key = name.lower().strip()
+        target = self.APP_MAP.get(key)
+
+        if not target:
+            # Fuzzy match
+            for k, v in self.APP_MAP.items():
+                if key in k or k in key:
+                    target = v
+                    break
+
+        if target:
+            # URL → open in browser
+            if target.startswith("http"):
+                webbrowser.open_new_tab(target)
+                return f"Opening {name} in browser."
+
+            # ms-settings: URI
+            if target.startswith("ms-settings:"):
+                subprocess.Popen(f"start {target}", shell=True)
+                return f"Opening {name} settings."
+
+            # .msc files
+            if target.endswith(".msc"):
+                subprocess.Popen(f"mmc.exe {target}", shell=True)
+                return f"Opening {name}."
+
+            try:
+                subprocess.Popen(target, shell=True)
+                return f"Opening {name}."
+            except Exception as e:
+                return f"Error opening {name}: {e}"
+
+        # Last resort: Windows search
+        try:
+            if HAS_PYAUTOGUI:
+                pyautogui.hotkey("win", "s")
+                time.sleep(0.7)
+                pyautogui.write(name, interval=0.05)
+                time.sleep(1.2)
+                pyautogui.press("enter")
+                return f"Searching Windows for '{name}'."
+        except Exception:
+            pass
+        return f"Cannot find '{name}'. Try installing it first."
+
+    def close(self, name: str) -> str:
+        """Close app by name — tries window title first, then process name."""
+        name_lower = name.lower()
+        closed = []
+
+        # 1. Try closing by window title (graceful)
+        if HAS_GW:
+            for win in gw.getAllWindows():
+                if name_lower in win.title.lower() and win.title:
+                    try:
+                        win.close()
+                        closed.append(win.title)
+                    except Exception:
+                        pass
+
+        if closed:
+            return f"Closed: {', '.join(closed[:3])}."
+
+        # 2. Kill by process name
+        exe_name = self.APP_MAP.get(name_lower, name_lower)
+        if not exe_name.endswith(".exe"):
+            exe_name += ".exe"
+
+        killed = []
+        for proc in psutil.process_iter(["name", "pid"]):
+            try:
+                if name_lower in proc.info["name"].lower():
+                    proc.kill()
+                    killed.append(proc.info["name"])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        if killed:
+            return f"Force-closed: {', '.join(set(killed))}."
+        return f"'{name}' is not running."
+
+    def list_running(self) -> str:
+        """List all visible running apps."""
+        apps = set()
+        if HAS_GW:
+            for win in gw.getAllWindows():
+                if win.title and win.visible:
+                    apps.add(win.title[:40])
+        if not apps:
+            for proc in psutil.process_iter(["name"]):
+                try:
+                    apps.add(proc.info["name"])
+                except Exception:
+                    pass
+        top = sorted(apps)[:15]
+        return "Running: " + ", ".join(top)
+
+    def switch_to(self, name: str) -> str:
+        """Bring a window to foreground."""
+        if not HAS_GW:
+            return "Window switching not available."
+        name_lower = name.lower()
+        for win in gw.getAllWindows():
+            if name_lower in win.title.lower() and win.title:
+                try:
+                    win.activate()
+                    return f"Switched to {win.title}."
+                except Exception as e:
+                    return f"Cannot switch: {e}"
+        return f"No window matching '{name}'."
+
+    def minimize(self, name: str) -> str:
+        if not HAS_GW:
+            return "Not available."
+        for win in gw.getAllWindows():
+            if name.lower() in win.title.lower():
+                win.minimize()
+                return f"Minimised {win.title}."
+        return f"Window '{name}' not found."
+
+    def maximize(self, name: str) -> str:
+        if not HAS_GW:
+            return "Not available."
+        for win in gw.getAllWindows():
+            if name.lower() in win.title.lower():
+                win.maximize()
+                return f"Maximised {win.title}."
+        return f"Window '{name}' not found."
+
+    def minimize_all(self) -> str:
+        if HAS_PYAUTOGUI:
+            pyautogui.hotkey("win", "d")
+            return "All windows minimised."
+        return "Not available."
+
+
 # ══════════════════════════════════════════════════════════════
-# PC CONTROL
+# FILE MANAGER
+# ══════════════════════════════════════════════════════════════
+
+class FileManager:
+
+    def create_file(self, path: str, content: str = "") -> str:
+        try:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+            return f"File created: {path}"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def create_folder(self, path: str) -> str:
+        try:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            return f"Folder created: {path}"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def delete(self, path: str) -> str:
+        try:
+            p = Path(path)
+            if p.is_file():
+                p.unlink()
+                return f"Deleted file: {path}"
+            elif p.is_dir():
+                shutil.rmtree(p)
+                return f"Deleted folder: {path}"
+            return f"Not found: {path}"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def move(self, src: str, dst: str) -> str:
+        try:
+            shutil.move(src, dst)
+            return f"Moved {src} → {dst}"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def copy(self, src: str, dst: str) -> str:
+        try:
+            if Path(src).is_dir():
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+            return f"Copied {src} → {dst}"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def rename(self, path: str, new_name: str) -> str:
+        try:
+            p = Path(path)
+            p.rename(p.parent / new_name)
+            return f"Renamed to {new_name}."
+        except Exception as e:
+            return f"Error: {e}"
+
+    def list_dir(self, path: str = ".") -> str:
+        try:
+            items = list(Path(path).iterdir())
+            names = [f"[D] {i.name}" if i.is_dir() else i.name for i in items[:20]]
+            return f"{path}:\n" + "\n".join(names)
+        except Exception as e:
+            return f"Error: {e}"
+
+    def open_file(self, path: str) -> str:
+        try:
+            os.startfile(path)
+            return f"Opened: {path}"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def find(self, name: str, root: str = str(Path.home())) -> str:
+        matches = []
+        try:
+            for p in Path(root).rglob(f"*{name}*"):
+                matches.append(str(p))
+                if len(matches) >= 8:
+                    break
+        except Exception:
+            pass
+        return "\n".join(matches) if matches else f"Not found: {name}"
+
+    def read_file(self, path: str) -> str:
+        try:
+            return Path(path).read_text(encoding="utf-8", errors="ignore")[:500]
+        except Exception as e:
+            return f"Error: {e}"
+
+    def write_file(self, path: str, content: str) -> str:
+        return self.create_file(path, content)
+
+    def open_folder(self, path: str) -> str:
+        try:
+            os.startfile(path)
+            return f"Opened folder: {path}"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def desktop(self) -> str:
+        return str(Path.home() / "Desktop")
+
+    def downloads(self) -> str:
+        return str(Path.home() / "Downloads")
+
+
+# ══════════════════════════════════════════════════════════════
+# SYSTEM CONTROL
+# ══════════════════════════════════════════════════════════════
+
+class SystemControl:
+
+    # ── Volume ────────────────────────────────────────────────
+    def set_volume(self, level: int) -> str:
+        level = max(0, min(100, int(level)))
+        # Method 1: PowerShell nircmd (if installed)
+        try:
+            r = subprocess.run(
+                f"nircmd.exe setsysvolume {int(level/100*65535)}",
+                shell=True, capture_output=True, timeout=3
+            )
+            if r.returncode == 0:
+                return f"Volume set to {level}%."
+        except Exception:
+            pass
+        # Method 2: PowerShell
+        try:
+            ps = (f"$obj=New-Object -ComObject WScript.Shell;"
+                  f"1..50|%{{$obj.SendKeys([char]174)}};"
+                  f"1..{int(level/2)}|%{{$obj.SendKeys([char]175)}}")
+            subprocess.run(["powershell","-Command",ps],
+                           capture_output=True, timeout=8)
+            return f"Volume set to ~{level}%."
+        except Exception:
+            pass
+        # Method 3: pyautogui keys
+        if HAS_PYAUTOGUI:
+            for _ in range(50): pyautogui.press("volumedown")
+            for _ in range(int(level/2)): pyautogui.press("volumeup")
+            return f"Volume set to ~{level}%."
+        return "Volume control unavailable."
+
+    def volume_up(self) -> str:
+        if HAS_PYAUTOGUI:
+            for _ in range(5):
+                pyautogui.press("volumeup")
+            return "Volume increased."
+        return "pyautogui not available."
+
+    def volume_down(self) -> str:
+        if HAS_PYAUTOGUI:
+            for _ in range(5):
+                pyautogui.press("volumedown")
+            return "Volume decreased."
+        return "pyautogui not available."
+
+    def mute(self) -> str:
+        if HAS_PYAUTOGUI:
+            pyautogui.press("volumemute")
+            return "Audio muted/unmuted."
+        return "pyautogui not available."
+
+    # ── Brightness ────────────────────────────────────────────
+    def set_brightness(self, level: int) -> str:
+        level = max(0, min(100, int(level)))
+        try:
+            ps = f"(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,{level})"
+            subprocess.run(["powershell", "-Command", ps],
+                           capture_output=True, timeout=5)
+            return f"Brightness set to {level}%."
+        except Exception as e:
+            return f"Brightness error: {e}"
+
+    # ── Power ─────────────────────────────────────────────────
+    def shutdown(self, delay: int = 60) -> str:
+        subprocess.Popen(f"shutdown /s /t {delay}", shell=True)
+        return f"Shutdown scheduled in {delay} seconds. Say 'cancel shutdown' to abort."
+
+    def cancel_shutdown(self) -> str:
+        subprocess.Popen("shutdown /a", shell=True)
+        return "Shutdown cancelled."
+
+    def restart(self, delay: int = 10) -> str:
+        subprocess.Popen(f"shutdown /r /t {delay}", shell=True)
+        return f"Restarting in {delay} seconds."
+
+    def sleep(self) -> str:
+        subprocess.Popen("rundll32.exe powrprof.dll,SetSuspendState 0,1,0", shell=True)
+        return "Going to sleep."
+
+    def lock(self) -> str:
+        ctypes.windll.user32.LockWorkStation()
+        return "Workstation locked."
+
+    def hibernate(self) -> str:
+        subprocess.Popen("shutdown /h", shell=True)
+        return "Hibernating."
+
+    # ── Network ───────────────────────────────────────────────
+    def get_ip(self) -> str:
+        try:
+            import socket
+            hostname = socket.gethostname()
+            ip = socket.gethostbyname(hostname)
+            return f"Hostname: {hostname}, IP: {ip}"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def wifi_on(self) -> str:
+        subprocess.run("netsh interface set interface Wi-Fi enable",
+                       shell=True, capture_output=True)
+        return "Wi-Fi enabled."
+
+    def wifi_off(self) -> str:
+        subprocess.run("netsh interface set interface Wi-Fi disable",
+                       shell=True, capture_output=True)
+        return "Wi-Fi disabled."
+
+    def get_wifi_networks(self) -> str:
+        try:
+            r = subprocess.run("netsh wlan show networks",
+                               shell=True, capture_output=True, text=True)
+            lines = [l for l in r.stdout.split("\n") if "SSID" in l][:6]
+            return "\n".join(lines) if lines else "No Wi-Fi networks found."
+        except Exception as e:
+            return f"Error: {e}"
+
+    def ping(self, host: str) -> str:
+        try:
+            r = subprocess.run(f"ping -n 3 {host}", shell=True,
+                               capture_output=True, text=True, timeout=15)
+            lines = [l for l in r.stdout.split("\n") if "ms" in l or "Average" in l]
+            return "\n".join(lines[-3:]) if lines else r.stdout[:200]
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ── Clipboard ─────────────────────────────────────────────
+    def copy_to_clipboard(self, text: str) -> str:
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+            root.clipboard_clear()
+            root.clipboard_append(text)
+            root.update()
+            # Keep clipboard alive
+            root.after(500, root.destroy)
+            root.mainloop()
+            return f"Copied to clipboard: {text[:50]}"
+        except Exception as e:
+            return f"Clipboard error: {e}"
+
+    def get_clipboard(self) -> str:
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+            text = root.clipboard_get()
+            root.destroy()
+            return f"Clipboard: {text[:200]}"
+        except Exception as e:
+            return f"Clipboard error: {e}"
+
+    # ── Display ───────────────────────────────────────────────
+    def get_screen_resolution(self) -> str:
+        if HAS_PYAUTOGUI:
+            w, h = pyautogui.size()
+            return f"Resolution: {w}x{h}"
+        return "pyautogui not available."
+
+    def take_screenshot(self, path: str = None) -> str:
+        if not HAS_PIL:
+            return "Pillow not installed."
+        if not path:
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = str(Path.home() / "Desktop" / f"jarvis_{ts}.png")
+        ImageGrab.grab().save(path)
+        return f"Screenshot saved: {path}"
+
+    # ── System info ───────────────────────────────────────────
+    def full_info(self) -> str:
+        cpu   = psutil.cpu_percent(interval=0.5)
+        ram   = psutil.virtual_memory()
+        disk  = psutil.disk_usage("/")
+        bat   = psutil.sensors_battery()
+        now   = datetime.datetime.now().strftime("%H:%M, %A %d %B")
+        uptime_s = time.time() - psutil.boot_time()
+        uptime = str(datetime.timedelta(seconds=int(uptime_s)))
+
+        bat_str = f" | Battery: {bat.percent:.0f}%" if bat else ""
+        return (f"{now} | CPU: {cpu}% | "
+                f"RAM: {ram.percent}% ({ram.available//1024**2}MB free) | "
+                f"Disk: {disk.percent}%{bat_str} | Uptime: {uptime}")
+
+    def list_processes(self, top: int = 10) -> str:
+        procs = []
+        for p in psutil.process_iter(["name", "cpu_percent", "memory_percent"]):
+            try:
+                procs.append(p.info)
+            except Exception:
+                pass
+        procs.sort(key=lambda x: x.get("cpu_percent", 0), reverse=True)
+        lines = [f"{p['name'][:25]:<25} CPU:{p['cpu_percent']:.1f}% MEM:{p['memory_percent']:.1f}%"
+                 for p in procs[:top]]
+        return "\n".join(lines)
+
+    def kill_process(self, name: str) -> str:
+        killed = []
+        for proc in psutil.process_iter(["name", "pid"]):
+            try:
+                if name.lower() in proc.info["name"].lower():
+                    proc.kill()
+                    killed.append(proc.info["name"])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return f"Killed: {', '.join(set(killed))}" if killed else f"Process '{name}' not found."
+
+    # ── Run commands ──────────────────────────────────────────
+    def run(self, cmd: str) -> str:
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True,
+                               text=True, timeout=15)
+            out = (r.stdout or r.stderr).strip()
+            return out[:400] if out else "Done."
+        except subprocess.TimeoutExpired:
+            return "Command timed out."
+        except Exception as e:
+            return f"Error: {e}"
+
+    def run_as_admin(self, cmd: str) -> str:
+        try:
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", "cmd.exe", f"/c {cmd}", None, 1)
+            return f"Running as admin: {cmd}"
+        except Exception as e:
+            return f"Error: {e}"
+
+
+# ══════════════════════════════════════════════════════════════
+# KEYBOARD & MOUSE CONTROL
+# ══════════════════════════════════════════════════════════════
+
+class InputControl:
+
+    def press_keys(self, *keys) -> str:
+        if not HAS_PYAUTOGUI:
+            return "pyautogui not available."
+        pyautogui.hotkey(*keys)
+        return f"Pressed: {'+'.join(keys)}"
+
+    def type_text(self, text: str) -> str:
+        if not HAS_PYAUTOGUI:
+            return "pyautogui not available."
+        time.sleep(0.5)
+        pyautogui.write(text, interval=0.04)
+        return f"Typed: {text}"
+
+    def move_mouse(self, x: int, y: int) -> str:
+        if not HAS_PYAUTOGUI:
+            return "pyautogui not available."
+        pyautogui.moveTo(x, y, duration=0.3)
+        return f"Mouse moved to ({x},{y})."
+
+    def click(self, x: int = None, y: int = None) -> str:
+        if not HAS_PYAUTOGUI:
+            return "pyautogui not available."
+        if x and y:
+            pyautogui.click(x, y)
+            return f"Clicked at ({x},{y})."
+        pyautogui.click()
+        return "Clicked."
+
+    def scroll(self, direction: str, amount: int = 3) -> str:
+        if not HAS_PYAUTOGUI:
+            return "pyautogui not available."
+        delta = amount if direction == "up" else -amount
+        pyautogui.scroll(delta)
+        return f"Scrolled {direction}."
+
+    def common_shortcuts(self, action: str) -> str:
+        shortcuts = {
+            "copy":         ("ctrl", "c"),
+            "paste":        ("ctrl", "v"),
+            "cut":          ("ctrl", "x"),
+            "undo":         ("ctrl", "z"),
+            "redo":         ("ctrl", "y"),
+            "save":         ("ctrl", "s"),
+            "select all":   ("ctrl", "a"),
+            "new tab":      ("ctrl", "t"),
+            "close tab":    ("ctrl", "w"),
+            "new window":   ("ctrl", "n"),
+            "find":         ("ctrl", "f"),
+            "refresh":      ("f5",),
+            "fullscreen":   ("f11",),
+            "task manager": ("ctrl", "shift", "esc"),
+            "desktop":      ("win", "d"),
+            "lock":         ("win", "l"),
+            "screenshot":   ("win", "shift", "s"),
+            "run":          ("win", "r"),
+            "settings":     ("win", "i"),
+            "file explorer":("win", "e"),
+            "action center":("win", "a"),
+            "notification": ("win", "n"),
+            "zoom in":      ("ctrl", "="),
+            "zoom out":     ("ctrl", "-"),
+            "alt tab":      ("alt", "tab"),
+        }
+        key = action.lower()
+        if key in shortcuts:
+            return self.press_keys(*shortcuts[key])
+        return f"Unknown shortcut: {action}"
+
+
+# ══════════════════════════════════════════════════════════════
+# BROWSER CONTROL
+# ══════════════════════════════════════════════════════════════
+
+class BrowserControl:
+
+    def open_url(self, url: str) -> str:
+        if not url.startswith("http"):
+            url = "https://" + url
+        webbrowser.open_new_tab(url)
+        return f"Opened: {url}"
+
+    def search(self, query: str, engine: str = "google") -> str:
+        engines = {
+            "google":    f"https://www.google.com/search?q={query.replace(' ', '+')}",
+            "youtube":   f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}",
+            "wikipedia": f"https://en.wikipedia.org/w/index.php?search={query.replace(' ', '+')}",
+            "github":    f"https://github.com/search?q={query.replace(' ', '+')}",
+            "amazon":    f"https://www.amazon.com/s?k={query.replace(' ', '+')}",
+            "bing":      f"https://www.bing.com/search?q={query.replace(' ', '+')}",
+        }
+        url = engines.get(engine.lower(), engines["google"])
+        webbrowser.open_new_tab(url)
+        return f"Searching '{query}' on {engine}."
+
+    def new_tab(self) -> str:
+        if HAS_PYAUTOGUI:
+            pyautogui.hotkey("ctrl", "t")
+            return "New tab opened."
+        return "pyautogui not available."
+
+    def close_tab(self) -> str:
+        if HAS_PYAUTOGUI:
+            pyautogui.hotkey("ctrl", "w")
+            return "Tab closed."
+        return "pyautogui not available."
+
+    def refresh(self) -> str:
+        if HAS_PYAUTOGUI:
+            pyautogui.press("f5")
+            return "Page refreshed."
+        return "pyautogui not available."
+
+    def go_back(self) -> str:
+        if HAS_PYAUTOGUI:
+            pyautogui.hotkey("alt", "left")
+            return "Navigated back."
+        return "pyautogui not available."
+
+    def go_forward(self) -> str:
+        if HAS_PYAUTOGUI:
+            pyautogui.hotkey("alt", "right")
+            return "Navigated forward."
+        return "pyautogui not available."
+
+    def open_incognito(self, browser: str = "chrome") -> str:
+        cmds = {
+            "chrome": "chrome.exe --incognito",
+            "firefox": "firefox.exe --private-window",
+            "edge": "msedge.exe --inprivate",
+        }
+        cmd = cmds.get(browser.lower(), cmds["chrome"])
+        subprocess.Popen(cmd, shell=True)
+        return f"Opened {browser} in incognito mode."
+
+
+# ══════════════════════════════════════════════════════════════
+# COMMAND PARSER  —  maps voice/text commands to actions
+# ══════════════════════════════════════════════════════════════
+
+class CommandParser:
+    """
+    Takes a plain-English command string and routes it to the
+    correct PC control action. Returns a result string.
+    """
+
+    def __init__(self):
+        self.apps    = AppManager()
+        self.files   = FileManager()
+        self.system  = SystemControl()
+        self.input   = InputControl()
+        self.browser = BrowserControl()
+
+    def parse(self, command: str) -> str | None:
+        """
+        Returns result string if a PC command matched, else None
+        (None means pass to AI brain).
+        """
+        c = command.lower().strip()
+        words = c.split()
+
+        # ── APP CONTROL ──────────────────────────────────────
+        if c.startswith("open "):
+            return self.apps.open(command[5:].strip())
+
+        if c.startswith("close ") or c.startswith("kill "):
+            app = re.sub(r"^(close|kill)\s+", "", c)
+            return self.apps.close(app)
+
+        if any(p in c for p in ("what's running", "list apps",
+                                 "running apps", "what is open",
+                                 "what apps are open")):
+            return self.apps.list_running()
+
+        if c.startswith("switch to "):
+            return self.apps.switch_to(c[10:])
+
+        if c.startswith("minimize "):
+            return self.apps.minimize(c[9:])
+
+        if c.startswith("maximize "):
+            return self.apps.maximize(c[9:])
+
+        if any(p in c for p in ("minimize all", "show desktop",
+                                 "minimise all")):
+            return self.apps.minimize_all()
+
+        # ── FILE CONTROL ─────────────────────────────────────
+        if c.startswith("create file "):
+            return self.files.create_file(command[12:].strip())
+
+        if c.startswith("create folder ") or c.startswith("make folder "):
+            path = re.sub(r"^(create|make)\s+folder\s+", "", c)
+            return self.files.create_folder(path)
+
+        if c.startswith("delete ") and ("file" in c or "folder" in c):
+            path = re.sub(r"^delete\s+(file|folder)\s+", "", c)
+            return self.files.delete(path)
+
+        if c.startswith("open file "):
+            return self.files.open_file(command[10:].strip())
+
+        if c.startswith("open folder ") or c.startswith("open the "):
+            path = re.sub(r"^open\s+(folder|the)\s+", "", c)
+            if "desktop" in path:
+                return self.files.open_folder(self.files.desktop())
+            if "download" in path:
+                return self.files.open_folder(self.files.downloads())
+            return self.files.open_folder(path)
+
+        if c.startswith("find file ") or c.startswith("search file "):
+            name = re.sub(r"^(find|search)\s+file\s+", "", c)
+            return self.files.find(name)
+
+        if c.startswith("read file ") or c.startswith("read "):
+            path = re.sub(r"^read\s+(file\s+)?", "", c)
+            return self.files.read_file(path)
+
+        if "list files" in c or "list folder" in c or "show files" in c:
+            path_match = re.search(r"in (.+)$", c)
+            path = path_match.group(1) if path_match else "."
+            return self.files.list_dir(path)
+
+        # ── VOLUME ───────────────────────────────────────────
+        vol_match = re.search(r"(set|change|volume)\s+(volume\s+)?(to\s+)?(\d+)", c)
+        if vol_match:
+            return self.system.set_volume(int(vol_match.group(4)))
+
+        if any(p in c for p in ("volume up", "increase volume", "louder")):
+            return self.system.volume_up()
+
+        if any(p in c for p in ("volume down", "decrease volume", "quieter", "lower volume")):
+            return self.system.volume_down()
+
+        if any(p in c for p in ("mute", "unmute", "silence")):
+            return self.system.mute()
+
+        # ── BRIGHTNESS ───────────────────────────────────────
+        bright_match = re.search(r"brightness\s+(to\s+)?(\d+)", c)
+        if bright_match:
+            return self.system.set_brightness(int(bright_match.group(2)))
+
+        # ── POWER ────────────────────────────────────────────
+        if any(p in c for p in ("shut down", "shutdown computer",
+                                 "turn off computer", "shut the computer")):
+            return self.system.shutdown(60)
+
+        if any(p in c for p in ("cancel shutdown", "abort shutdown")):
+            return self.system.cancel_shutdown()
+
+        if any(p in c for p in ("restart", "reboot")):
+            return self.system.restart()
+
+        if any(p in c for p in ("sleep", "go to sleep", "hibernate")):
+            if "hibernate" in c:
+                return self.system.hibernate()
+            return self.system.sleep()
+
+        if any(p in c for p in ("lock", "lock screen", "lock computer",
+                                 "lock workstation")):
+            return self.system.lock()
+
+        # ── NETWORK ──────────────────────────────────────────
+        if any(p in c for p in ("my ip", "ip address", "what is my ip")):
+            return self.system.get_ip()
+
+        if any(p in c for p in ("wifi on", "turn on wifi", "enable wifi")):
+            return self.system.wifi_on()
+
+        if any(p in c for p in ("wifi off", "turn off wifi", "disable wifi")):
+            return self.system.wifi_off()
+
+        if any(p in c for p in ("wifi networks", "available wifi",
+                                 "show wifi", "scan wifi")):
+            return self.system.get_wifi_networks()
+
+        if c.startswith("ping "):
+            return self.system.ping(c[5:].strip())
+
+        # ── SYSTEM INFO ───────────────────────────────────────
+        if any(p in c for p in ("system info", "system status", "cpu usage",
+                                 "ram usage", "memory usage", "battery",
+                                 "how is my computer", "computer status")):
+            return self.system.full_info()
+
+        if any(p in c for p in ("running processes", "top processes",
+                                 "what processes", "task list")):
+            return self.system.list_processes()
+
+        if c.startswith("kill process "):
+            return self.system.kill_process(c[13:])
+
+        if c.startswith("run command ") or c.startswith("execute "):
+            cmd = re.sub(r"^(run command|execute)\s+", "", c)
+            return self.system.run(cmd)
+
+        # ── SCREENSHOT ───────────────────────────────────────
+        if any(p in c for p in ("screenshot", "capture screen",
+                                 "take a screenshot", "snap screen")):
+            return self.system.take_screenshot()
+
+        # ── CLIPBOARD ─────────────────────────────────────────
+        if c.startswith("copy ") and "clipboard" in c:
+            text = re.sub(r"^copy\s+", "", c).replace("to clipboard", "").strip()
+            return self.system.copy_to_clipboard(text)
+
+        if any(p in c for p in ("get clipboard", "what's in clipboard",
+                                 "clipboard content", "paste content")):
+            return self.system.get_clipboard()
+
+        # ── KEYBOARD SHORTCUTS ────────────────────────────────
+        if any(p in c for p in ("press", "shortcut", "hotkey")):
+            action = re.sub(r"^(press|shortcut|hotkey)\s+", "", c)
+            return self.input.common_shortcuts(action)
+
+        if c.startswith("type "):
+            return self.input.type_text(command[5:].strip())
+
+        # ── BROWSER ──────────────────────────────────────────
+        if c.startswith("open website ") or c.startswith("go to "):
+            url = re.sub(r"^(open website|go to)\s+", "", c)
+            return self.browser.open_url(url)
+
+        if any(p in c for p in ("search on youtube", "youtube search",
+                                 "find on youtube")):
+            q = re.sub(r".*(search on youtube|youtube search|find on youtube)\s*", "", c)
+            return self.browser.search(q, "youtube")
+
+        if any(p in c for p in ("search for ", "google ", "search ")):
+            q = re.sub(r"^(search for|search|google)\s+", "", c)
+            return self.browser.search(q)
+
+        if any(p in c for p in ("new tab", "open tab")):
+            return self.browser.new_tab()
+
+        if any(p in c for p in ("close tab", "close this tab")):
+            return self.browser.close_tab()
+
+        if any(p in c for p in ("refresh", "reload page")):
+            return self.browser.refresh()
+
+        if any(p in c for p in ("go back", "back")):
+            return self.browser.go_back()
+
+        if any(p in c for p in ("go forward", "forward")):
+            return self.browser.go_forward()
+
+        if any(p in c for p in ("incognito", "private window",
+                                 "private browsing")):
+            return self.browser.open_incognito()
+
+        return None  # Not a PC command → pass to AI
+
+
+# (self-test removed)
+
+
+# ══════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════
+
+WAKE_WORD     = "jarvis"
+AI_MODEL      = "qwen2.5:7b"
+VISION_MODEL  = "llava:latest"
+MEMORY_FILE   = "jarvis_memory.json"
+MAX_HISTORY   = 30
+ENERGY_THRESH = 300
+
+SYSTEM_PROMPT = """You are J.A.R.V.I.S. (Just A Rather Very Intelligent System).
+Personality:
+- Calm, witty, slightly formal British tone.
+- Keep replies SHORT — 1 to 3 sentences max unless asked to elaborate.
+- Occasionally call the user "sir".
+- Never say you cannot help — offer the closest alternative.
+- Be crisp on task completion: "Done, sir." or "Opening now."
+"""
+
+# ══════════════════════════════════════════════════════════════
+# MEMORY
+# ══════════════════════════════════════════════════════════════
+
+class Memory:
+    def __init__(self, path=MEMORY_FILE):
+        self.path = Path(path)
+        self._data = self._load()
+
+    def _load(self):
+        if self.path.exists():
+            try:
+                return json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {"facts": {}, "history": []}
+
+    def save(self):
+        self.path.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+
+    def append_turn(self, role, content):
+        self._data["history"].append({"role": role, "content": content})
+        if len(self._data["history"]) > MAX_HISTORY:
+            self._data["history"] = self._data["history"][-MAX_HISTORY:]
+        self.save()
+
+    def get_history(self):
+        return self._data["history"]
+
+    def clear_history(self):
+        self._data["history"] = []
+        self.save()
+
+# ══════════════════════════════════════════════════════════════
+# TTS (runs in its own thread to avoid blocking UI)
+# ══════════════════════════════════════════════════════════════
+
+class TTSEngine:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._engine = None
+        self._init_engine()
+
+    def _init_engine(self):
+        try:
+            self._engine = pyttsx3.init()
+            self._engine.setProperty("rate", 155)
+            self._engine.setProperty("volume", 0.92)
+            voices = self._engine.getProperty("voices")
+            for v in voices:
+                if "english" in v.name.lower():
+                    self._engine.setProperty("voice", v.id)
+                    break
+        except Exception as e:
+            print(f"TTS init error: {e}")
+
+    def speak(self, text: str):
+        def _run():
+            with self._lock:
+                try:
+                    self._engine.say(text)
+                    self._engine.runAndWait()
+                except Exception:
+                    # Reinit if crashed
+                    try:
+                        self._init_engine()
+                        self._engine.say(text)
+                        self._engine.runAndWait()
+                    except Exception:
+                        pass
+        threading.Thread(target=_run, daemon=True).start()
+
+# ══════════════════════════════════════════════════════════════
+# MICROPHONE — works with sounddevice OR pyaudio
 # ══════════════════════════════════════════════════════════════
 
 class PCManager:
@@ -1287,7 +2412,8 @@ class PCManager:
             return f"Cannot open '{name}'."
 
     def search_web(self, query):
-        webbrowser.open(f"https://www.google.com/search?q={query.replace(' ', '+')}")
+        url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+        webbrowser.open_new_tab(url)
         return f"Searching for: {query}"
 
     def take_screenshot(self):
@@ -1365,7 +2491,7 @@ class AIBrain:
 # ══════════════════════════════════════════════════════════════
 
 def handle_command(command: str, pc: PCManager, brain: AIBrain,
-                   tts: TTSEngine, mic: MicManager, ui) -> str:
+                   tts: TTSEngine, mic: MicManager, ui, parser=None) -> str:
     """Process a command. Returns response text."""
     command = command.strip()
     if not command:
@@ -1377,70 +2503,28 @@ def handle_command(command: str, pc: PCManager, brain: AIBrain,
 
     c = command.lower()
 
-    # ── Quick time/date ──────────────────────────────────────
-    if any(x in c for x in ("what time", "current time", "time is it")):
-        r = datetime.datetime.now().strftime("It is %H:%M, sir.")
-        tts.speak(r); return r
+    # ── Exit (always handle first) ────────────────────────────
+    if any(x in c for x in ("goodbye", "exit", "quit", "bye")):
+        tts.speak("Signing off, sir. Have a good one.")
+        time.sleep(1.5)
+        ui.quit_app()
+        return "Goodbye."
 
-    if any(x in c for x in ("what day", "today's date", "what date")):
-        r = datetime.datetime.now().strftime("Today is %A, %d %B %Y.")
-        tts.speak(r); return r
-
-    # ── Open app ─────────────────────────────────────────────
-    if c.startswith("open "):
-        app = command[5:].strip()
-        r = pc.open_app(app)
-        tts.speak(r); return r
-
-    # ── Search ───────────────────────────────────────────────
-    if any(x in c for x in ("search for", "google", "look up")):
-        q = re.sub(r"(search for|search|google|look up)", "", c).strip()
-        r = pc.search_web(q)
-        tts.speak(f"Searching for {q}, sir.")
-        return r
-
-    # ── Screenshot ───────────────────────────────────────────
-    if any(x in c for x in ("screenshot", "capture screen", "take a screenshot")):
-        r = pc.take_screenshot()
-        tts.speak(r); return r
-
-    # ── Type ─────────────────────────────────────────────────
-    if c.startswith("type "):
-        text = command[5:].strip()
-        r = pc.type_text(text)
-        tts.speak(r); return r
-
-    # ── System info ──────────────────────────────────────────
-    if any(x in c for x in ("system status", "system info", "cpu", "ram usage")):
-        r = pc.get_system_info()
-        tts.speak(r); return r
-
-    # ── Screen analysis ──────────────────────────────────────
-    if any(x in c for x in ("analyze screen", "what's on screen", "what is on my screen")):
-        tts.speak("Analyzing your screen, sir.")
-        r = pc.analyze_screen()
-        tts.speak(r[:250])
-        return r
-
-    # ── Run command ──────────────────────────────────────────
-    if c.startswith("run "):
-        cmd = command[4:].strip()
-        r = pc.run_command(cmd)
-        tts.speak("Done, sir." if len(r) < 20 else r[:150])
-        return r
-
-    # ── Memory ───────────────────────────────────────────────
+    # ── Memory clear ─────────────────────────────────────────
     if any(x in c for x in ("clear history", "forget everything", "reset memory")):
         brain.memory.clear_history()
         r = "Memory cleared, sir."
         tts.speak(r); return r
 
-    # ── Exit ─────────────────────────────────────────────────
-    if any(x in c for x in ("goodbye", "exit", "quit", "shutdown", "bye")):
-        tts.speak("Signing off, sir. Have a good one.")
-        time.sleep(1.5)
-        ui.quit_app()
-        return "Goodbye."
+    # ── PC Control (CommandParser handles ALL pc commands) ────
+    if parser is not None:
+        try:
+            pc_result = parser.parse(command)
+            if pc_result is not None:
+                tts.speak(pc_result[:250])
+                return pc_result
+        except Exception as e:
+            print(f"   parser error: {e}")
 
     # ── AI fallback ──────────────────────────────────────────
     response = brain.reply(command)
@@ -1493,6 +2577,7 @@ class JARVISApp:
         self.pc     = PCManager()
         self.brain  = AIBrain(self.memory)
         self.mic    = MicManager()
+        self.parser = CommandParser()
 
         self._log("[ sys ] J.A.R.V.I.S. v3.0 initialising...")
         self.set_mode("idle", "Starting up…")
@@ -1797,7 +2882,15 @@ class JARVISApp:
             self._update_bar(self.bar_disk, disk)
         except Exception:
             pass
-        self.root.after(3000, self._update_stats)
+
+        # Update MIC dot — green=active, dim=idle
+        try:
+            mic_on = getattr(self.mic, "_mic_active", False)
+            self.lbl_mic.config(fg="#00e676" if mic_on else "#1a3a5c")
+        except Exception:
+            pass
+
+        self.root.after(500, self._update_stats)
 
     # ── STATE ───────────────────────────────────────────────────
 
@@ -1865,8 +2958,23 @@ class JARVISApp:
         self._process_command(text)
 
     def _process_command(self, command: str):
+        command = command.strip()
+        if not command:
+            return
         if self._busy:
-            self._log("[ sys ] Still processing — please wait")
+            # Wait up to 5 sec for busy to clear, then run
+            def _wait_and_run():
+                for _ in range(50):
+                    if not self._busy:
+                        break
+                    time.sleep(0.1)
+                self.root.after(0, lambda: self._process_command_now(command))
+            threading.Thread(target=_wait_and_run, daemon=True).start()
+            return
+        self._process_command_now(command)
+
+    def _process_command_now(self, command: str):
+        if self._busy:
             return
         self._busy = True
 
@@ -1876,9 +2984,9 @@ class JARVISApp:
         def _run():
             try:
                 self.root.after(0, lambda: self.set_mode("think", "Processing…"))
-                self.brain._parser_ref = self.parser
                 resp = handle_command(command, self.pc, self.brain,
-                                       self.tts, self.mic, self)
+                                       self.tts, self.mic, self,
+                                       parser=self.parser)
                 short = resp[:60] + ("…" if len(resp) > 60 else "")
                 self.root.after(0, lambda: self._log(f"[ ai  ] {resp[:80]}"))
                 self.root.after(0, lambda: self._log_cmd(command, resp))

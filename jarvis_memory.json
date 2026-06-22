@@ -1,0 +1,29 @@
+{
+  "facts": {},
+  "history": [
+    {
+      "role": "user",
+      "content": "jarvis"
+    },
+    {
+      "role": "assistant",
+      "content": "At your service, sir. How may I assist you today?"
+    },
+    {
+      "role": "user",
+      "content": "jarvis"
+    },
+    {
+      "role": "assistant",
+      "content": "Opening now. What can I do for you, sir?"
+    },
+    {
+      "role": "user",
+      "content": "Jarvis"
+    },
+    {
+      "role": "assistant",
+      "content": "Aye, sir. How can I assist you?"
+    }
+  ]
+}
