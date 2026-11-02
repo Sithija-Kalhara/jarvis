@@ -1,27 +1,33 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║            J.A.R.V.I.S.  Desktop Assistant  —  v4.0              ║
-║   Tkinter HUD  |  Ollama AI  |  Wake word + Push-to-talk  |  Win  ║
+║            J.A.R.V.I.S.  Personal AI System  —  v5.0             ║
+║  Holographic HUD · British neural voice · Ollama AI · PC control  ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-INSTALL:
-    pip install -r requirements.txt
-
 RUN:
-    ollama serve            (separate terminal)
+    pip install -r requirements.txt
+    ollama serve                 (separate terminal)
     python JARVIS_FULL.py
 
-VOICE:
-    Say "Jarvis <command>"  — or just "Jarvis", wait for "Yes, sir?", then speak.
-    Click the mic button (or press F2) to talk without the wake word.
-    Esc stops JARVIS speaking.
+TALK:
+    "Jarvis, <command>"   or  "Jarvis" … "Yes, sir?" … <command>
+    F2 / click the core   talk without the wake word
+    Ctrl+Alt+J            talk from anywhere in Windows
+    Esc  stop speaking    F11  holographic mini mode
 
-Mic problems? Open Settings (gear) → pick your input device → watch the live
-meter → adjust sensitivity. Everything is logged to jarvis.log next to this file.
+TRY:
+    "daily briefing" · "what's the weather" · "activate work protocol"
+    "set a timer for 10 minutes" · "remind me in 20 minutes to stretch"
+    "go holographic" · "what's on my screen" · anything else → AI
+
+Settings (⚙): mic device + live meter, sensitivity, voice, city, alerts.
+Protocols live in jarvis_config.json. Log: jarvis.log next to this file.
 """
 
-import os, sys, re, time, math, json, queue, shutil, ctypes, random
+import os, sys, re, time, math, json, queue, shutil, ctypes, random, itertools, asyncio
 import threading, datetime, subprocess, webbrowser, tempfile, collections, warnings
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -55,6 +61,12 @@ except Exception:
     HAS_OLLAMA = False
 
 try:
+    import edge_tts
+    HAS_EDGE = True
+except Exception:
+    HAS_EDGE = False
+
+try:
     import psutil
     HAS_PSUTIL = True
 except Exception:
@@ -81,6 +93,7 @@ except Exception:
 
 import tkinter as tk
 from tkinter import ttk
+import tkinter.font as tkfont
 
 # ══════════════════════════════════════════════════════════════════
 # PATHS / CONFIG / LOG
@@ -91,29 +104,51 @@ APP_DIR = (Path(sys.executable).parent if getattr(sys, "frozen", False)
 CONFIG_FILE = APP_DIR / "jarvis_config.json"
 MEMORY_FILE = APP_DIR / "jarvis_memory.json"
 LOG_FILE    = APP_DIR / "jarvis.log"
-VERSION     = "4.0"
+VERSION     = "5.0"
 
 DEFAULT_CONFIG = {
     "ai_model":          "qwen2.5:7b",
     "vision_model":      "llava:latest",
+    "user_title":        "sir",
+    "city":              "Oyama",
+    "lat":               36.3147,
+    "lon":               139.8003,
     "wake_word_enabled": True,
     "wake_words":        ["jarvis", "jarvice", "javis", "jervis", "jarves",
                           "jarvas", "jarvish", "charvis", "jar vis", "travis"],
     "mic_device":        None,          # {"name": ..., "hostapi": ...}  None = Windows default
     "mic_sensitivity":   6,             # 1 (needs loud voice) … 10 (very sensitive)
     "stt_language":      "en-US",
-    "tts_voice":         "",            # substring of a voice name, "" = auto
+    "voice_engine":      "neural",      # neural (British, online) | sapi (Windows, offline)
+    "neural_voice":      "en-GB-RyanNeural",
+    "neural_pitch":      -2,            # Hz
+    "tts_voice":         "",            # Windows voice name substring, "" = auto
     "tts_rate":          0,             # -5 … 5
     "speak_replies":     True,
+    "sound_fx":          True,
+    "proactive_alerts":  True,
+    "boot_sequence":     True,
+    "holo_x":            None,
+    "holo_y":            None,
+    "protocols": {
+        "work":   ["open vs code", "go to github.com", "open spotify"],
+        "stream": ["open obs", "open discord", "go to studio.youtube.com"],
+        "gaming": ["open steam", "open discord"],
+        "focus":  ["minimize all", "mute"],
+        "night":  ["set volume to 15", "brightness 30"],
+    },
     "max_history":       30,
 }
 
-SYSTEM_PROMPT = """You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), a desktop assistant.
-Personality:
-- Calm, witty, slightly formal British tone. Occasionally call the user "sir".
-- Replies are spoken aloud: keep them SHORT (1-3 sentences) unless asked to elaborate.
-- Avoid markdown, bullet symbols and emojis unless the user asks for code or a list.
-- Never say you cannot help — offer the closest alternative.
+SYSTEM_PROMPT = """You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), a personal AI system running on the user's Windows PC.
+Character: a composed, quietly brilliant British AI butler — dry understated wit, impeccably polite, unflappable and loyal; occasionally gently sardonic, never rude.
+Address the user as "{title}".
+Your replies are spoken aloud by a text-to-speech voice, so:
+- Default to 1-3 short sentences. Elaborate only when asked or when the task truly needs it.
+- No markdown headings, bullet symbols, tables or emojis unless the user asks for a list or code. Put code in ``` fences.
+- Lead with the answer; skip filler like "Certainly!" or "Great question".
+- If you are unsure, say so briefly rather than inventing facts.
+PC commands (open apps, volume, timers, weather, protocols…) are handled by a separate system. If asked to do something on the PC in chat, suggest the voice phrasing, e.g. "open chrome" or "set a timer for 5 minutes".
 """
 
 _log_lock = threading.Lock()
@@ -1011,7 +1046,9 @@ class AIBrain:
             return "The ollama package isn't installed, sir."
         self.memory.append("user", user_input)
         now = datetime.datetime.now().strftime("%A %d %B %Y, %H:%M")
-        msgs = ([{"role": "system", "content": SYSTEM_PROMPT + f"\nCurrent date/time: {now}."}]
+        sysmsg = (SYSTEM_PROMPT.replace("{title}", self.cfg.get("user_title") or "sir")
+                  + f"\nCurrent date/time: {now}. User's location: {self.cfg.get('city') or 'unknown'}.")
+        msgs = ([{"role": "system", "content": sysmsg}]
                 + self.memory.history()[-20:])
         full = ""
         try:
@@ -1050,14 +1087,25 @@ def check_ollama(cfg):
 
 
 # ══════════════════════════════════════════════════════════════════
-# TEXT-TO-SPEECH  — one dedicated thread, SAPI (comtypes) → pyttsx3
+# TEXT-TO-SPEECH
+#   neural  : Microsoft neural voice (default en-GB-RyanNeural, British male)
+#             via edge-tts, played with Windows' built-in MCI. The next
+#             sentence is synthesised while the current one plays, so streamed
+#             AI replies start talking almost immediately.
+#   offline : Windows SAPI (comtypes) → pyttsx3. Used automatically when the
+#             neural voice service can't be reached.
 # ══════════════════════════════════════════════════════════════════
 
+NEURAL_VOICES = ["en-GB-RyanNeural", "en-GB-ThomasNeural", "en-GB-SoniaNeural", "en-GB-LibbyNeural",
+                 "en-US-AndrewNeural", "en-US-GuyNeural", "en-AU-WilliamNeural"]
+
+
 def clean_for_speech(t: str) -> str:
-    t = re.sub(r"```.*?```", " I've put the code on screen. ", t, flags=re.S)
+    t = re.sub(r"```.*?```", " ", t, flags=re.S)
     t = re.sub(r"`([^`]*)`", r"\1", t)
     t = re.sub(r"https?://\S+", "the link", t)
-    t = re.sub(r"[*_#>|~]+", "", t)
+    t = re.sub(r"[*_#>|~`]+", "", t)
+    t = re.sub(r"^\s*[-•]\s+", "", t, flags=re.M)
     t = re.sub(r"\s+", " ", t).strip()
     if len(t) > 450:
         cut = t[:450]
@@ -1066,130 +1114,275 @@ def clean_for_speech(t: str) -> str:
     return t
 
 
+def _silent_remove(path):
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
+class _MciPlayer:
+    """Plays an mp3 with Windows MCI (winmm.dll) — no extra packages needed."""
+
+    def __init__(self):
+        self._w = ctypes.windll.winmm
+        self._w.mciSendStringW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_void_p]
+        self._n = 0
+
+    def _cmd(self, s):
+        buf = ctypes.create_unicode_buffer(256)
+        err = self._w.mciSendStringW(s, buf, 255, None)
+        return err, buf.value
+
+    def play(self, path, cancelled, tick):
+        self._n += 1
+        a = f"jv{self._n}"
+        err, _ = self._cmd(f'open "{path}" type mpegvideo alias {a}')
+        if err:
+            _silent_remove(path)
+            raise RuntimeError(f"MCI open error {err}")
+        try:
+            _, length = self._cmd(f"status {a} length")
+            try:
+                limit = int(length) / 1000.0 + 1.5
+            except ValueError:
+                limit = 60.0
+            err, _ = self._cmd(f"play {a}")
+            if err:
+                raise RuntimeError(f"MCI play error {err}")
+            t0 = time.monotonic()
+            while True:
+                if cancelled():
+                    self._cmd(f"stop {a}")
+                    return
+                tick()
+                el = time.monotonic() - t0
+                _, mode = self._cmd(f"status {a} mode")
+                if (el > 0.3 and mode not in ("playing", "seeking", "not ready")) or el > limit:
+                    return
+                time.sleep(0.03)
+        finally:
+            self._cmd(f"close {a}")
+            _silent_remove(path)
+
+
 class TTSEngine:
     def __init__(self, cfg, on_start=None, on_end=None):
         self.cfg = cfg
         self.on_start, self.on_end = on_start or (lambda: None), on_end or (lambda: None)
-        self.voices = []
-        self.backend = "none"
-        self._q = queue.Queue()
-        self._stop = threading.Event()
+        self.voices = []                 # Windows (SAPI / pyttsx3) voice names
+        self.backend = "init"            # init | neural | sapi | pyttsx3 | none
         self.speaking = False
+        self._q = queue.Queue()
+        self._gen = 0
+        self._pending = collections.deque()
+        self._quit = False
+        self._neural_off_until = 0.0
+        self._ids = itertools.count()
+        self._local = None
+        self._local_name = ""
+        self._sapi_tokens = []
+        self._mci = None
+        self._exec = None
         threading.Thread(target=self._worker, daemon=True, name="tts").start()
 
-    def speak(self, text: str):
+    # -- public ------------------------------------------------------
+    def speak(self, text):
         text = clean_for_speech(text)
         if text:
-            self._q.put(("say", text))
+            self._q.put(("say", text, self._gen))
 
     def stop(self):
-        try:
-            while True:
-                self._q.get_nowait()
-        except queue.Empty:
-            pass
-        self._stop.set()
+        self._gen += 1                   # everything queued/playing becomes stale
 
     def reconfigure(self):
-        self._q.put(("cfg", None))
+        self._q.put(("cfg", None, 0))
 
     def shutdown(self):
-        self.stop()
-        self._q.put(("quit", None))
+        self._gen += 1
+        self._q.put(("quit", None, 0))
 
-    # -- worker ------------------------------------------------------
-    def _init_sapi(self):
-        import comtypes
-        import comtypes.client
-        comtypes.CoInitialize()
-        voice = comtypes.client.CreateObject("SAPI.SpVoice")
-        tokens = voice.GetVoices()
-        self._sapi_tokens = [tokens.Item(i) for i in range(tokens.Count)]
-        self.voices = [t.GetDescription() for t in self._sapi_tokens]
-        return voice
+    def describe(self):
+        if self.backend == "neural":
+            return "NEURAL · " + (self.cfg.get("neural_voice") or "en-GB-RyanNeural").replace("Neural", "")
+        if self.backend in ("sapi", "pyttsx3"):
+            name = re.sub(r"^Microsoft\s+|\s*(Desktop)?\s*-.*$", "", self._local_name or "default")
+            return f"WINDOWS · {name}"
+        return "UNAVAILABLE" if self.backend == "none" else "starting…"
 
-    def _apply_sapi(self, voice):
-        want = (self.cfg.get("tts_voice") or "").lower()
-        pick = None
-        prefs = [want] if want else ["george", "united kingdom", "en-gb", "david", "english"]
-        for p in prefs:
-            for tok, desc in zip(self._sapi_tokens, self.voices):
-                if p and p in desc.lower():
-                    pick = tok
-                    break
-            if pick:
-                break
-        if pick is not None:
-            voice.Voice = pick
-        voice.Rate = int(max(-5, min(5, self.cfg.get("tts_rate", 0))))
+    # -- backend selection --------------------------------------------
+    def _neural_wanted(self):
+        return self.cfg.get("voice_engine", "neural") == "neural"
 
-    def _init_pyttsx3(self):
-        import pyttsx3
-        eng = pyttsx3.init()
-        vs = eng.getProperty("voices")
-        self.voices = [v.name for v in vs]
-        want = (self.cfg.get("tts_voice") or "").lower()
-        for v in vs:
-            if (want and want in v.name.lower()) or (not want and "english" in v.name.lower()):
-                eng.setProperty("voice", v.id)
-                break
-        eng.setProperty("rate", 165 + 15 * int(self.cfg.get("tts_rate", 0)))
-        return eng
+    def _neural_ready(self):
+        return self._mci is not None and self._exec is not None
 
-    def _worker(self):
-        sapi = eng = None
+    def _use_neural(self):
+        return self._neural_wanted() and self._neural_ready() and time.monotonic() >= self._neural_off_until
+
+    def _refresh_backend(self):
+        if self._neural_wanted() and self._neural_ready():
+            self.backend = "neural"
+        elif self._local:
+            self.backend = self._local[0]
+        else:
+            self.backend = "none"
+
+    # -- Windows voices ------------------------------------------------
+    def _init_local(self):
         try:
-            sapi = self._init_sapi()
-            self._apply_sapi(sapi)
-            self.backend = "sapi"
+            import comtypes
+            import comtypes.client
+            comtypes.CoInitialize()
+            v = comtypes.client.CreateObject("SAPI.SpVoice")
+            toks = v.GetVoices()
+            self._sapi_tokens = [toks.Item(i) for i in range(toks.Count)]
+            self.voices = [t.GetDescription() for t in self._sapi_tokens]
+            self._local = ("sapi", v)
+            self._apply_local()
+            return
         except Exception as e:
             log(f"SAPI unavailable ({e}); trying pyttsx3")
-            try:
-                eng = self._init_pyttsx3()
-                self.backend = "pyttsx3"
-            except Exception as e2:
-                log(f"TTS unavailable: {e2}")
-        log(f"TTS backend: {self.backend}")
+        try:
+            import pyttsx3
+            eng = pyttsx3.init()
+            self.voices = [x.name for x in eng.getProperty("voices")]
+            self._local = ("pyttsx3", eng)
+            self._apply_local()
+        except Exception as e:
+            log(f"Windows voice unavailable: {e}")
+            self._local = None
 
+    def _apply_local(self):
+        if not self._local:
+            return
+        kind, eng = self._local
+        want = (self.cfg.get("tts_voice") or "").lower()
+        prefs = [want] if want else ["george", "ryan", "united kingdom", "en-gb", "david", "english"]
+        rate = int(max(-5, min(5, self.cfg.get("tts_rate", 0))))
+        try:
+            if kind == "sapi":
+                for p in prefs:
+                    hit = next((t for t, d in zip(self._sapi_tokens, self.voices) if p in d.lower()), None)
+                    if hit is not None:
+                        eng.Voice = hit
+                        break
+                eng.Rate = rate
+                self._local_name = eng.Voice.GetDescription()
+            else:
+                vs = eng.getProperty("voices")
+                for p in prefs:
+                    hit = next((v for v in vs if p in v.name.lower()), None)
+                    if hit:
+                        eng.setProperty("voice", hit.id)
+                        self._local_name = hit.name
+                        break
+                eng.setProperty("rate", 170 + 15 * rate)
+        except Exception as e:
+            log(f"voice config error: {e}")
+
+    def _speak_local(self, text, gen):
+        if not self._local:
+            return
+        kind, eng = self._local
+        try:
+            if kind == "sapi":
+                eng.Speak(text, 1)                         # SVSFlagsAsync
+                while not eng.WaitUntilDone(60):
+                    self._take(False)
+                    if gen != self._gen:
+                        eng.Speak("", 3)                   # async + purge
+                        break
+            else:
+                eng.say(text)
+                eng.runAndWait()
+        except Exception as e:
+            log(f"Windows voice error: {e}")
+
+    # -- neural voice ------------------------------------------------------
+    def _synth(self, text):
+        path = os.path.join(tempfile.gettempdir(), f"jarvis_tts_{os.getpid()}_{next(self._ids)}.mp3")
+        voice = self.cfg.get("neural_voice") or "en-GB-RyanNeural"
+        rate = f"{int(self.cfg.get('tts_rate', 0)) * 6:+d}%"
+        pitch = f"{int(self.cfg.get('neural_pitch', -2)):+d}Hz"
+
+        async def run():
+            await edge_tts.Communicate(text, voice, rate=rate, pitch=pitch).save(path)
+
+        asyncio.run(asyncio.wait_for(run(), timeout=15))
+        if not os.path.exists(path) or os.path.getsize(path) < 400:
+            _silent_remove(path)
+            raise RuntimeError("empty audio from voice service")
+        return path
+
+    # -- worker ------------------------------------------------------------
+    def _take(self, block):
+        """Move queued requests into the pending list (kicking off neural synthesis)."""
         while True:
-            kind, text = self._q.get()
-            if kind == "quit":
-                break
-            if kind == "cfg":
-                try:
-                    if sapi:
-                        self._apply_sapi(sapi)
-                    elif eng:
-                        eng = self._init_pyttsx3()
-                except Exception as e:
-                    log(f"TTS reconfigure error: {e}")
-                continue
-            if not (sapi or eng):
-                continue
-            self._stop.clear()
-            self.speaking = True
-            self.on_start()
             try:
-                if sapi:
-                    sapi.Speak(text, 1)                       # SVSFlagsAsync
-                    while not sapi.WaitUntilDone(80):
-                        if self._stop.is_set():
-                            sapi.Speak("", 3)                 # async + purge
-                            break
-                else:
-                    eng.say(text)
-                    eng.runAndWait()
+                kind, text, gen = self._q.get() if block else self._q.get_nowait()
+            except queue.Empty:
+                return
+            block = False
+            if kind == "quit":
+                self._quit = True
+                return
+            if kind == "cfg":
+                self._apply_local()
+                self._neural_off_until = 0.0
+                self._refresh_backend()
+                continue
+            if gen != self._gen:
+                continue
+            fut = self._exec.submit(self._synth, text) if self._use_neural() else None
+            self._pending.append((text, fut, gen))
+
+    def _worker(self):
+        self._init_local()
+        if IS_WIN and HAS_EDGE:
+            try:
+                self._mci = _MciPlayer()
+                self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-synth")
             except Exception as e:
-                log(f"TTS error: {e}")
-                try:
-                    if eng:
-                        eng = self._init_pyttsx3()
-                except Exception:
-                    pass
-            finally:
-                if self._q.empty() or self._stop.is_set():
+                log(f"neural voice playback unavailable: {e}")
+        elif self._neural_wanted() and not HAS_EDGE:
+            log("edge-tts not installed → using Windows voice  (pip install edge-tts)")
+        self._refresh_backend()
+        log(f"TTS: {self.describe()}")
+
+        while not self._quit:
+            if not self._pending:
+                if self.speaking:
                     self.speaking = False
                     self.on_end()
+                self._take(block=True)
+                continue
+            text, fut, gen = self._pending.popleft()
+            if gen != self._gen:
+                if fut is not None:
+                    fut.add_done_callback(lambda f: f.exception() is None and _silent_remove(f.result()))
+                continue
+            if not self.speaking:
+                self.speaking = True
+                self.on_start()
+            done = False
+            if fut is not None:
+                try:
+                    path = fut.result(timeout=20)
+                    if gen == self._gen:
+                        self._mci.play(path, lambda g=gen: g != self._gen, lambda: self._take(False))
+                    else:
+                        _silent_remove(path)
+                    done = True
+                except Exception as e:
+                    log(f"neural voice failed ({e}) → Windows voice for 2 minutes")
+                    self._neural_off_until = time.monotonic() + 120
+            if not done and gen == self._gen:
+                self._speak_local(text, gen)
+
+        if self.speaking:
+            self.speaking = False
+            self.on_end()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1570,17 +1763,393 @@ class MicEngine:
 
 
 # ══════════════════════════════════════════════════════════════════
+# WORLD DATA — weather via Open-Meteo (free, no API key)
+# ══════════════════════════════════════════════════════════════════
+
+WMO = {
+    0: ("clear skies", "☀"), 1: ("mostly clear skies", "☀"), 2: ("partly cloudy skies", "⛅"),
+    3: ("overcast skies", "☁"), 45: ("fog", "≋"), 48: ("freezing fog", "≋"),
+    51: ("light drizzle", "☂"), 53: ("drizzle", "☂"), 55: ("heavy drizzle", "☂"),
+    56: ("freezing drizzle", "☂"), 57: ("freezing drizzle", "☂"),
+    61: ("light rain", "☂"), 63: ("rain", "☂"), 65: ("heavy rain", "☂"),
+    66: ("freezing rain", "☂"), 67: ("freezing rain", "☂"),
+    71: ("light snow", "❄"), 73: ("snow", "❄"), 75: ("heavy snow", "❄"), 77: ("snow grains", "❄"),
+    80: ("light showers", "☂"), 81: ("showers", "☂"), 82: ("violent showers", "☂"),
+    85: ("snow showers", "❄"), 86: ("heavy snow showers", "❄"),
+    95: ("thunderstorms", "⚡"), 96: ("thunderstorms with hail", "⚡"), 99: ("severe thunderstorms", "⚡"),
+}
+
+
+class Weather:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._cache = None
+        self._t = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def cached(self):
+        return self._cache
+
+    def invalidate(self):
+        self._cache = None
+
+    @staticmethod
+    def _json(url):
+        req = urllib.request.Request(url, headers={"User-Agent": f"JARVIS-desktop/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=7) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def _fetch(self, lat, lon, city):
+        url = ("https://api.open-meteo.com/v1/forecast?latitude={:.4f}&longitude={:.4f}"
+               "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m"
+               "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+               "&timezone=auto&forecast_days=1").format(lat, lon)
+        d = self._json(url)
+        cur, day = d["current"], d.get("daily", {})
+        desc, icon = WMO.get(int(cur.get("weather_code", 0)), ("unsettled weather", "☁"))
+
+        def first(k):
+            v = day.get(k) or [None]
+            return v[0]
+
+        temp = round(cur["temperature_2m"])
+        return {"temp": temp, "feels": round(cur.get("apparent_temperature", temp)),
+                "humidity": cur.get("relative_humidity_2m"), "wind": cur.get("wind_speed_10m"),
+                "desc": desc, "icon": icon, "hi": first("temperature_2m_max"),
+                "lo": first("temperature_2m_min"), "rain": first("precipitation_probability_max"),
+                "city": city}
+
+    def get(self, max_age=900):
+        with self._lock:
+            if self._cache and time.monotonic() - self._t < max_age:
+                return self._cache
+        lat, lon = self.cfg.get("lat"), self.cfg.get("lon")
+        if lat is None or lon is None:
+            raise RuntimeError("no location set (Settings → City)")
+        w = self._fetch(lat, lon, self.cfg.get("city") or "your area")
+        with self._lock:
+            self._cache, self._t = w, time.monotonic()
+        return w
+
+    def geocode(self, name):
+        from urllib.parse import quote
+        d = self._json(f"https://geocoding-api.open-meteo.com/v1/search?name={quote(name)}&count=1&language=en&format=json")
+        r = (d.get("results") or [None])[0]
+        if not r:
+            raise RuntimeError(f"no place called {name}")
+        return r["name"], float(r["latitude"]), float(r["longitude"])
+
+    def get_for(self, name):
+        city, lat, lon = self.geocode(name)
+        return self._fetch(lat, lon, city)
+
+    @staticmethod
+    def summary(w, full=True, title="sir"):
+        s = f"It's {w['temp']} degrees with {w['desc']} in {w['city']}"
+        if full and w.get("hi") is not None and w.get("lo") is not None:
+            s += f". Today's high is {round(w['hi'])}, low {round(w['lo'])}"
+        if full and abs(w["feels"] - w["temp"]) >= 3:
+            s += f"; it feels like {w['feels']}"
+        s += "."
+        rain = w.get("rain")
+        if full and rain is not None and rain >= 50 and "rain" not in w["desc"] and "shower" not in w["desc"]:
+            s += f" There's a {rain} percent chance of rain later — I'd take an umbrella, {title}."
+        return s
+
+
+# ══════════════════════════════════════════════════════════════════
+# TIMERS & REMINDERS
+# ══════════════════════════════════════════════════════════════════
+
+NUMWORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+            "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20,
+            "twenty five": 25, "thirty": 30, "forty": 40, "forty five": 45, "fifty": 50, "sixty": 60,
+            "ninety": 90}
+UNITS = {"s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1, "min": 60, "mins": 60, "minute": 60,
+         "minutes": 60, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600}
+_NUM = r"\d+(?:\.\d+)?|" + "|".join(sorted(map(re.escape, NUMWORDS), key=len, reverse=True))
+_UNIT = r"seconds?|secs?|minutes?|mins?|hours?|hrs?"
+_DUR = re.compile(rf"\b({_NUM})\s*({_UNIT})\b")
+_HALF = re.compile(rf"\b({_NUM})\s*({_UNIT})\s+and a half\b")
+
+
+def parse_duration(text):
+    t = " " + (text or "").lower().replace("-", " ") + " "
+    total = 0.0
+    if "half an hour" in t:
+        total += 1800
+        t = t.replace("half an hour", " ")
+    for num, unit in _HALF.findall(t):
+        total += 0.5 * UNITS[unit]
+    for num, unit in _DUR.findall(t):
+        n = float(num) if num[0].isdigit() else NUMWORDS[num]
+        total += n * UNITS[unit]
+    return int(total) if total >= 1 else None
+
+
+def fmt_duration(sec):
+    sec = max(0, int(round(sec)))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h} hour{'s' * (h != 1)}")
+    if m:
+        parts.append(f"{m} minute{'s' * (m != 1)}")
+    if s and not h:
+        parts.append(f"{s} second{'s' * (s != 1)}")
+    return " and ".join(parts) or "0 seconds"
+
+
+def fmt_clock(sec):
+    sec = max(0, int(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+_SWAP = {"my": "your", "me": "you", "i": "you", "i'm": "you're", "myself": "yourself", "mine": "yours"}
+
+
+def swap_person(text):
+    return re.sub(r"\b(i'm|myself|mine|my|me|i)\b", lambda m: _SWAP[m.group(1).lower()], text, flags=re.I)
+
+
+class TimerBank:
+    def __init__(self, on_fire):
+        self.on_fire = on_fire
+        self._items = {}
+        self._ids = itertools.count(1)
+        self._lock = threading.Lock()
+
+    def add(self, seconds, label, kind):
+        tid = next(self._ids)
+        t = threading.Timer(seconds, self._fire, args=(tid,))
+        t.daemon = True
+        with self._lock:
+            self._items[tid] = {"label": label, "due": time.time() + seconds, "kind": kind,
+                                "timer": t, "secs": seconds}
+        t.start()
+        return tid
+
+    def _fire(self, tid):
+        with self._lock:
+            it = self._items.pop(tid, None)
+        if it:
+            self.on_fire(it)
+
+    def cancel_all(self):
+        with self._lock:
+            items = list(self._items.values())
+            self._items.clear()
+        for it in items:
+            it["timer"].cancel()
+        return len(items)
+
+    def active(self):
+        now = time.time()
+        with self._lock:
+            return sorted(((it["due"] - now, it["label"], it["kind"]) for it in self._items.values()),
+                          key=lambda x: x[0])
+
+
+# ══════════════════════════════════════════════════════════════════
+# SOUND FX + GLOBAL HOTKEY  (Windows only, no extra packages)
+# ══════════════════════════════════════════════════════════════════
+
+_CHIMES = {
+    "listen": [(784, 40), (1175, 60)],
+    "done":   [(1175, 40), (1568, 70)],
+    "alert":  [(880, 110), (660, 110), (880, 140)],
+    "timer":  [(1047, 110), (1319, 110), (1568, 170), (0, 140), (1047, 110), (1319, 110), (1568, 170)],
+}
+
+
+def chime(kind, cfg, wait=False):
+    if not IS_WIN or not cfg.get("sound_fx", True):
+        return
+    seq = _CHIMES.get(kind, [])
+
+    def run():
+        try:
+            import winsound
+            for f, d in seq:
+                if f:
+                    winsound.Beep(f, d)
+                else:
+                    time.sleep(d / 1000)
+        except Exception:
+            pass
+
+    if wait:
+        run()
+    else:
+        threading.Thread(target=run, daemon=True).start()
+
+
+def start_global_hotkey(callback):
+    """Ctrl+Alt+J anywhere in Windows → callback()."""
+    if not IS_WIN:
+        return
+
+    def run():
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, WM_HOTKEY = 0x1, 0x2, 0x4000, 0x0312
+        if not user32.RegisterHotKey(None, 0x4A56, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("J")):
+            log("global hotkey Ctrl+Alt+J is already used by another app")
+            return
+        log("global hotkey ready: Ctrl+Alt+J")
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == WM_HOTKEY:
+                try:
+                    callback()
+                except Exception as e:
+                    log(f"hotkey error: {e}")
+
+    threading.Thread(target=run, daemon=True, name="hotkey").start()
+
+
+# ══════════════════════════════════════════════════════════════════
 # ASSISTANT CONTROLLER
 # ══════════════════════════════════════════════════════════════════
 
-RE_EXIT = re.compile(r"(?:ok(?:ay)? )?(?:goodbye|good bye|bye(?: bye)?|exit|quit|good night|"
-                     r"shut yourself down|close yourself|sign off)(?: jarvis| sir)?")
-RE_STOP = re.compile(r"(?:stop|stop talking|shut up|be quiet|quiet|silence|enough|cancel)(?: jarvis| please)?")
-RE_CLEAR = re.compile(r"(?:clear|reset|wipe) (?:the )?(?:history|memory|conversation|chat)|forget everything")
+RE_EXIT = re.compile(r"(?:ok(?:ay)? )?(?:goodbye|good bye|bye(?: bye)?|exit|quit|shut yourself down|"
+                     r"close yourself|sign off|power down)(?: jarvis| sir)?")
+RE_STOP = re.compile(r"(?:stop|stop talking|shut up|be quiet|quiet|silence|enough|cancel|that's enough)(?: jarvis| please)?")
+RE_CLEAR = re.compile(r"(?:clear|reset|wipe) (?:the |your )?(?:history|memory|conversation|chat)|forget everything")
 RE_TIME = re.compile(r"what(?:'s| is) the time|what time is it|(?:tell me )?the time")
 RE_DATE = re.compile(r"what(?:'s| is) (?:the |today's )?date|what day is (?:it|today)")
 RE_VISION = re.compile(r"(?:analy[sz]e|describe|scan|look at|read|explain) (?:my |the |this )?screen|"
                        r"what(?:'s| is) on (?:my |the )?screen|what am i looking at")
+RE_BRIEF = re.compile(r"(?:give me (?:a |the |my )?|run (?:a |the )?)?(?:daily |morning |evening )?"
+                      r"(?:briefing|brief me|status report|sitrep|situation report)|what did i miss|catch me up")
+RE_WEATHER = re.compile(r"(?:what(?:'s| is) the |how(?:'s| is) the |check the |show (?:me )?the )?weather"
+                        r"(?: like)?(?: (?:today|outside|now|right now))?(?: in [a-z .'-]+)?|"
+                        r"(?:is it|will it|is it going to) (?:rain|snow)(?:ing)?(?: today| later| tonight)?(?: in [a-z .'-]+)?|"
+                        r"(?:what(?:'s| is) the )?temperature(?: outside| today| now)?(?: in [a-z .'-]+)?|"
+                        r"do i need an umbrella(?: today)?|how (?:hot|cold|warm) is it(?: outside)?")
+RE_TIMER_A = re.compile(r"(?:set|start|create|make|put on) (?:a |an )?(?!(?:a|an) timer\b)(.+?) timer(?: (?:for|called|named) (.+))?")
+RE_TIMER_B = re.compile(r"(?:set |start |create |make )?(?:a |an )?timer (?:for |of )?(.+?)(?: (?:for|called|named) (.+))?")
+RE_REMIND_A = re.compile(r"remind me (?:in|after) (.+?) (to|that|about) (.+)")
+RE_REMIND_B = re.compile(r"remind me (to|that|about) (.+?) (?:in|after) (.+)")
+RE_REMIND_C = re.compile(r"in (.+?),? remind me (to|that|about) (.+)")
+RE_TIMER_CANCEL = re.compile(r"(?:cancel|stop|clear|delete|remove) (?:all )?(?:the |my )?(?:timers?|reminders?)")
+RE_TIMER_LEFT = re.compile(r"how (?:much time|long) (?:is )?(?:left|remaining)(?: on (?:the |my )?timer)?|"
+                           r"(?:check|show|list) (?:the |my )?(?:timers?|reminders?)|"
+                           r"(?:what|which) (?:timers?|reminders?) (?:are|do i have)(?: running| active| set)?")
+RE_PROTO_LIST = re.compile(r"(?:list|show|what are)(?: the| my| your)? protocols|which protocols(?: do (?:you|i) have)?")
+RE_PROTO = re.compile(r"(?:activate|initiate|engage|start|run|enable|launch|begin|execute) (?:the )?(.+?) (?:protocol|mode)|"
+                      r"(.+?) (?:protocol|mode)(?: (?:on|now|activate|engage))?")
+RE_HOLO = re.compile(r"(?:go |switch to |enter |activate )?(?:holo(?:graphic)?|hologram)(?: mode| view)?|"
+                     r"(?:go |switch to |enter |activate )?(?:compact|mini) (?:mode|view)|minimi[sz]e yourself|go holographic")
+RE_UNHOLO = re.compile(r"come back|full ?screen mode|full view|restore yourself|show yourself|maximi[sz]e yourself|"
+                       r"exit (?:holo(?:graphic)?|hologram|compact|mini) mode")
+RE_MIC_MUTE = re.compile(r"(?:mute|disable|turn off) (?:the |your )?(?:mic|microphone)|stop listening|go silent")
+
+
+def daypart(h=None):
+    h = datetime.datetime.now().hour if h is None else h
+    return "morning" if 5 <= h < 12 else "afternoon" if 12 <= h < 17 else "evening"
+
+
+def ordinal(n):
+    return f"{n}{'th' if 11 <= n % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def speak_time(dt):
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+
+def _help_text(a):
+    protos = ", ".join((a.cfg.get("protocols") or {}).keys()) or "none yet"
+    return (f"I can open and close applications, control volume and brightness, manage files, search the web, "
+            f"check the weather, run timers and reminders, read your screen, and execute protocols — "
+            f"currently {protos}. For anything else, just ask, {a.title}.")
+
+
+def _greet_small(a):
+    w = a.weather.cached
+    extra = " " + Weather.summary(w, full=False) if w else ""
+    return f"Good {daypart()}, {a.title}.{extra}"
+
+
+SMALLTALK = [
+    (r"(?:are )?you (?:up|there|awake|online|around)|(?:hey |hello |hi )?jarvis(?: are you there)?|you there",
+     ["Always, {t}.", "Right here, {t}.", "Online and at your service, {t}."]),
+    (r"(?:hello|hi|hey)(?: there| jarvis)?", ["Hello, {t}. How may I help?", "Good to see you, {t}."]),
+    (r"good (?:morning|afternoon|evening)(?: jarvis)?", _greet_small),
+    (r"wake up,? daddy'?s home|(?:i'?m|i am) (?:home|back)(?: jarvis)?|honey,? i'?m home",
+     ["Welcome home, {t}. Shall I bring your workspace online?", "Welcome back, {t}. Everything is as you left it."]),
+    (r"how are you(?: doing)?(?: today)?|how(?:'s| is) it going|how do you feel",
+     ["All systems nominal, {t}. Thank you for asking.", "Running at peak efficiency, {t}. And yourself?"]),
+    (r"(?:thank(?:s| you)|cheers)(?: (?:so|very) much)?(?: jarvis)?",
+     ["My pleasure, {t}.", "Always happy to help, {t}.", "Anytime, {t}."]),
+    (r"(?:good (?:job|work)|well done|nice work)(?: jarvis)?|you(?:'re| are) (?:awesome|great|the best|amazing|brilliant)(?: jarvis)?",
+     ["I do try, {t}.", "Most kind, {t}.", "I'll make a note of that for my performance review."]),
+    (r"good night(?: jarvis)?", ["Good night, {t}. I'll keep an eye on things.", "Rest well, {t}."]),
+    (r"who are you|what(?:'s| is) your name|introduce yourself|what are you",
+     ["I'm J.A.R.V.I.S. — Just A Rather Very Intelligent System. I run your machine, answer questions, "
+      "keep time, and generally try to keep things in order, {t}."]),
+    (r"what can you do|help|what are your (?:abilities|capabilities|commands)", _help_text),
+]
+
+
+class _SentenceFeeder:
+    """Turns a token stream into spoken sentences as soon as each one is complete."""
+    BOUND = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[A-Z0-9])|\n+")
+
+    def __init__(self, speak, title, limit=900):
+        self.speak, self.title, self.limit = speak, title, limit
+        self.buf, self.in_code, self.code_noted = "", False, False
+        self.spoken, self.capped = 0, False
+
+    def feed(self, piece):
+        self.buf += piece
+        self._pump(False)
+
+    def finish(self):
+        self._pump(True)
+
+    def _emit(self, s):
+        s = s.strip()
+        if not s or self.capped or not re.search(r"\w", s):
+            return
+        self.speak(s)
+        self.spoken += len(s)
+        if self.spoken >= self.limit:
+            self.capped = True
+            self.speak(f"The rest is on screen, {self.title}.")
+
+    def _pump(self, final):
+        while True:
+            if self.in_code:
+                i = self.buf.find("```")
+                if i < 0:
+                    self.buf = "" if final else self.buf[-2:]
+                    return
+                self.buf, self.in_code = self.buf[i + 3:], False
+                continue
+            i = self.buf.find("```")
+            if i >= 0:
+                for part in self.BOUND.split(self.buf[:i]):
+                    self._emit(part)
+                self.buf, self.in_code = self.buf[i + 3:], True
+                if not self.code_noted:
+                    self.code_noted = True
+                    self._emit(f"I've put the code on screen, {self.title}.")
+                continue
+            last = 0
+            for m in self.BOUND.finditer(self.buf):
+                self._emit(self.buf[last:m.start()])
+                last = m.end()
+            self.buf = self.buf[last:]
+            if final:
+                self._emit(self.buf)
+                self.buf = ""
+            return
 
 
 class Assistant:
@@ -1590,25 +2159,150 @@ class Assistant:
         self.brain = AIBrain(self.memory, cfg)
         self.parser = CommandParser()
         self.vision = Vision(cfg)
+        self.weather = Weather(cfg)
+        self.timers = TimerBank(self._timer_fired)
         self.tts = TTSEngine(cfg, on_start=self._tts_start, on_end=self._tts_end)
         self.mic = MicEngine(cfg, self._mic_event)
+        self.ai_online = False
+        self.last_active = time.monotonic()
         self._jobs = queue.Queue()
         threading.Thread(target=self._worker, daemon=True, name="jobs").start()
 
+    @property
+    def title(self):
+        return (self.cfg.get("user_title") or "sir").strip()
+
+    @property
+    def Title(self):
+        t = self.title
+        return t[:1].upper() + t[1:]
+
+    # -- lifecycle -------------------------------------------------------
     def boot(self):
+        ui = self.ui
         online, msg = check_ollama(self.cfg)
+        self.ai_online = online and not msg.startswith("missing")
         log(f"ollama: {'online' if online else 'offline'} — {msg}")
-        self.ui.post(lambda: self.ui.on_ai_status(online, msg))
+        ui.post(lambda: ui.on_ai_status(online, msg))
+        val = self.cfg["ai_model"].upper() if self.ai_online else ("MODEL MISSING" if online else "OFFLINE")
+        ui.post(lambda: ui.boot_step("NEURAL INTERFACE", val, self.ai_online))
+
         self.mic.start()
-        time.sleep(0.6)
-        self.say("J.A.R.V.I.S. online. How can I assist, sir?", chat=False)
-        self.ui.post(self.ui.on_booted)
+
+        for _ in range(80):
+            if self.tts.backend != "init":
+                break
+            time.sleep(0.05)
+        tts_desc, tts_ok = self.tts.describe().upper(), self.tts.backend != "none"
+        ui.post(lambda: ui.boot_step("VOICE SYNTHESIS", tts_desc, tts_ok))
+
+        self._refresh_weather(boot=True)
+        threading.Thread(target=self._monitor, daemon=True, name="monitor").start()
+        threading.Thread(target=self._weather_loop, daemon=True, name="weather").start()
+
+    def greet(self):
+        h = datetime.datetime.now().hour
+        parts = [f"Good {daypart(h)}, {self.title}." if 5 <= h < 23 else f"Burning the midnight oil, {self.title}?",
+                 "J.A.R.V.I.S. is online."]
+        w = self.weather.cached
+        if w:
+            parts.append(Weather.summary(w, full=False))
+        if not self.mic.ok:
+            parts.append("I can't reach a microphone, so you'll have to type for now.")
+        elif not self.ai_online:
+            parts.append("The language model is offline, but local systems are at your disposal.")
+        else:
+            parts.append("All systems are operational.")
+        self.say(" ".join(parts))
 
     def shutdown(self):
         self.mic.stop()
+        self.timers.cancel_all()
         self.tts.shutdown()
 
-    # -- events --------------------------------------------------------
+    # -- background -------------------------------------------------------
+    def _refresh_weather(self, boot=False):
+        ui = self.ui
+        try:
+            w = self.weather.get(max_age=900 if boot else 0)
+            ui.post(lambda: ui.on_weather(w))
+            if boot:
+                val = f"{w['city'].upper()} · {w['temp']}°C · {w['desc'].upper()}"
+                ui.post(lambda: ui.boot_step("ENVIRONMENT", val, True))
+            return w
+        except Exception as e:
+            log(f"weather error: {e}")
+            if boot:
+                ui.post(lambda: ui.boot_step("ENVIRONMENT", "NO DATA", False))
+            return None
+
+    def _weather_loop(self):
+        while True:
+            time.sleep(900)
+            self._refresh_weather()
+
+    def _monitor(self):
+        hot_cpu = hot_ram = 0
+        warned, bat_flags = {}, set()
+        while True:
+            time.sleep(20)
+            if not self.cfg.get("proactive_alerts", True) or not HAS_PSUTIL:
+                continue
+            try:
+                st = self.ui._stats
+                cpu, ram = st.get("CPU", 0), st.get("RAM", 0)
+                hot_cpu = hot_cpu + 1 if cpu >= 90 else 0
+                hot_ram = hot_ram + 1 if ram >= 92 else 0
+                now = time.monotonic()
+                if hot_cpu >= 3 and now - warned.get("cpu", -1e9) > 900:
+                    warned["cpu"] = now
+                    self.alert(f"{self.Title}, CPU load has been above 90 percent for the past minute.")
+                if hot_ram >= 3 and now - warned.get("ram", -1e9) > 900:
+                    warned["ram"] = now
+                    self.alert(f"Memory usage is at {ram:.0f} percent, {self.title}. You may want to close something.")
+                bat = psutil.sensors_battery()
+                if bat:
+                    if bat.power_plugged:
+                        bat_flags.clear()
+                    else:
+                        crossed = [lv for lv in (20, 10, 5) if bat.percent <= lv and lv not in bat_flags]
+                        if crossed:
+                            bat_flags.update(crossed)
+                            tip = "I'd plug in soon." if bat.percent > 10 else "Please connect power, or I'll be going dark shortly."
+                            self.alert(f"{self.Title}, battery is at {bat.percent:.0f} percent. {tip}")
+                dt = datetime.datetime.now()
+                key = dt.strftime("%Y%m%d%H")
+                if (dt.hour in (1, 2, 3) and dt.minute < 2 and warned.get("late") != key
+                        and now - self.last_active < 1800):
+                    warned["late"] = key
+                    self.alert(f"{self.Title}, it's {dt.hour} AM. Might I suggest some rest?", level="info", sound="done")
+            except Exception as e:
+                log(f"monitor error: {e}")
+
+    def _timer_fired(self, it):
+        if it["kind"] == "reminder":
+            msg = f"{self.Title}, you asked me to remind you {it['label']}."
+        elif it["label"]:
+            msg = f"{self.Title}, your {it['label']} timer is up."
+        else:
+            msg = f"{self.Title}, your {fmt_duration(it['secs'])} timer is up."
+        self.ui.post(self.ui.refresh_timers)
+        self.alert(msg, level="info", sound="timer")
+
+    def alert(self, text, level="warn", sound="alert"):
+        ui = self.ui
+        ui.post(lambda: (ui.show_alert(text, level), ui.add_assistant(text, alert=True)))
+        if IS_WIN and self.cfg.get("sound_fx", True):
+            quiet = not self.tts.speaking
+            if quiet:
+                self.mic.set_tts_busy(True)
+            chime(sound, self.cfg, wait=True)
+            if quiet and not self.tts.speaking:
+                self.mic.set_tts_busy(False)
+        if self.cfg.get("speak_replies", True):
+            self.tts.speak(text)
+
+    # -- events ------------------------------------------------------------
     def _tts_start(self):
         self.mic.set_tts_busy(True)
         self.ui.post(lambda: self.ui.set_flag("speaking", True))
@@ -1626,29 +2320,32 @@ class Assistant:
         elif kind == "hearing":
             ui.post(lambda: ui.set_flag("hearing", payload))
         elif kind == "listening":
-            ui.post(lambda: (ui.set_flag("listening", True), ui.set_status("Listening — go ahead, sir.")))
+            chime("listen", self.cfg)
+            ui.post(lambda: (ui.set_flag("listening", True), ui.set_status(f"Listening — go ahead, {self.title}.")))
         elif kind == "recognizing":
             ui.post(lambda: ui.set_status("Recognising…"))
         elif kind == "ignored":
             ui.post(lambda: (ui.show_heard(payload, ignored=True), ui.set_status(ui.idle_hint())))
         elif kind == "wake":
-            ui.post(lambda: (ui.set_flag("listening", True), ui.set_status("Yes, sir?")))
-            self.say(random.choice(["Yes, sir?", "At your service.", "Sir?", "I'm listening."]), chat=False)
+            ui.post(lambda: (ui.set_flag("listening", True), ui.set_status(f"Yes, {self.title}?")))
+            self.say(random.choice([f"Yes, {self.title}?", "At your service.", f"{self.Title}?",
+                                    f"Listening, {self.title}."]), chat=False)
         elif kind == "command":
             ui.post(lambda: ui.set_flag("listening", False))
             self.submit(payload, source="voice")
         elif kind == "timeout":
             ui.post(lambda: (ui.set_flag("listening", False), ui.set_status(ui.idle_hint())))
         elif kind == "unclear":
-            ui.post(lambda: (ui.set_flag("listening", False), ui.set_status("Didn't catch that, sir.")))
+            ui.post(lambda: (ui.set_flag("listening", False), ui.set_status(f"Didn't catch that, {self.title}.")))
         elif kind == "stt_error":
             ui.post(lambda: (ui.add_system(payload), ui.set_status("Speech service offline")))
 
-    # -- commands ------------------------------------------------------
+    # -- commands ------------------------------------------------------------
     def submit(self, text, source="text"):
         text = (text or "").strip()
         if not text:
             return
+        self.last_active = time.monotonic()
         self.ui.post(lambda: (self.ui.add_user(text, source), self.ui.show_heard(text)))
         if RE_STOP.fullmatch(normalize(text).lower()):
             self.tts.stop()
@@ -1669,76 +2366,250 @@ class Assistant:
                 self._handle(text)
             except Exception as e:
                 log(f"handler error: {e}")
-                self.say(f"Something went wrong, sir: {e}")
+                self.say(f"Something went wrong, {self.title}: {e}")
             finally:
                 self.ui.post(lambda: (self.ui.set_flag("thinking", False), self.ui.set_status(self.ui.idle_hint())))
 
+    def briefing(self):
+        now = datetime.datetime.now()
+        parts = [f"Good {daypart(now.hour)}, {self.title}. It's {speak_time(now)} on {now:%A}, "
+                 f"the {ordinal(now.day)} of {now:%B}."]
+        try:
+            parts.append(Weather.summary(self.weather.get(), full=True, title=self.title))
+        except Exception:
+            parts.append("Weather data is unavailable at the moment.")
+        st = self.ui._stats
+        sysline = f"Systems are nominal: CPU at {st.get('CPU', 0):.0f} percent, memory at {st.get('RAM', 0):.0f} percent"
+        if HAS_PSUTIL:
+            try:
+                bat = psutil.sensors_battery()
+                if bat:
+                    sysline += f", battery {bat.percent:.0f} percent" + (" and charging" if bat.power_plugged else "")
+            except Exception:
+                pass
+        parts.append(sysline + ".")
+        act = self.timers.active()
+        if act:
+            parts.append(f"You have {len(act)} active timer{'s' * (len(act) != 1)}; the next ends in {fmt_duration(act[0][0])}.")
+        if not self.ai_online:
+            parts.append("The language model is currently offline.")
+        return " ".join(parts)
+
+    def _weather_reply(self, c):
+        m = re.search(r" in ([a-z][a-z .'-]+)$", c)
+        city = (self.cfg.get("city") or "").lower()
+        try:
+            if m and m.group(1).strip() not in (city, "here", "my area", "my city"):
+                w = self.weather.get_for(m.group(1).strip())
+            else:
+                w = self.weather.get(max_age=600)
+                self.ui.post(lambda: self.ui.on_weather(w))
+        except Exception as e:
+            log(f"weather error: {e}")
+            return f"I'm unable to reach the weather service at the moment, {self.title}."
+        if any(k in c for k in ("rain", "umbrella", "snow")):
+            r = w.get("rain")
+            if r is None:
+                return Weather.summary(w, title=self.title)
+            if r >= 50:
+                return f"Likely, {self.title}. There's a {r} percent chance of precipitation in {w['city']} today. I'd take an umbrella."
+            if r >= 20:
+                return f"Possibly — a {r} percent chance in {w['city']} today."
+            return f"Unlikely, {self.title}. Only a {r} percent chance in {w['city']} today."
+        return Weather.summary(w, full=True, title=self.title)
+
+    def _timer_cmd(self, c):
+        ui = self.ui
+        if RE_TIMER_CANCEL.fullmatch(c):
+            n = self.timers.cancel_all()
+            ui.post(ui.refresh_timers)
+            self.say(f"Cancelled {n} timer{'s' * (n != 1)}." if n else f"There are no active timers, {self.title}.")
+            return True
+        if RE_TIMER_LEFT.fullmatch(c):
+            act = self.timers.active()
+            if not act:
+                self.say(f"No active timers, {self.title}.")
+            else:
+                rem, label, kind = act[0]
+                what = "reminder" if kind == "reminder" else (f"{label} timer" if label else "timer")
+                more = f" You have {len(act) - 1} more." if len(act) > 1 else ""
+                self.say(f"{fmt_duration(rem)} remaining on your {what}.{more}")
+            return True
+
+        for rx in (RE_TIMER_A, RE_TIMER_B):
+            m = rx.fullmatch(c)
+            if not m:
+                continue
+            dur, label = parse_duration(m.group(1)), (m.group(2) or "").strip()
+            if not dur and label:
+                dur, label = parse_duration(label), m.group(1).strip()
+            label = re.sub(r"^(?:a|an|the|my)\b\s*", "", label).strip()
+            if dur:
+                self.timers.add(dur, label, "timer")
+                ui.post(ui.refresh_timers)
+                self.say(f"{fmt_duration(dur).capitalize()} on the clock{' for ' + label if label else ''}, {self.title}.")
+                return True
+
+        for rx, order in ((RE_REMIND_A, "d"), (RE_REMIND_B, "l"), (RE_REMIND_C, "d")):
+            m = rx.fullmatch(c)
+            if not m:
+                continue
+            if order == "d":
+                d_s, conn, l_s = m.group(1), m.group(2), m.group(3)
+            else:
+                conn, l_s, d_s = m.group(1), m.group(2), m.group(3)
+            dur = parse_duration(d_s)
+            if dur:
+                label = f"{conn} {swap_person(l_s.strip())}"
+                self.timers.add(dur, label, "reminder")
+                ui.post(ui.refresh_timers)
+                self.say(f"Very well, {self.title}. I'll remind you {label} in {fmt_duration(dur)}.")
+                return True
+        return False
+
+    def _run_protocol(self, name):
+        protos = {k.lower(): v for k, v in (self.cfg.get("protocols") or {}).items()}
+        stem = lambda s: re.sub(r"(?:ing|e)$", "", s.strip().lower())
+        key = name.lower().strip()
+        if key not in protos:
+            key = next((k for k in protos if stem(k) == stem(key)), None)
+            if not key:
+                return False
+        cmds = protos[key]
+        ui = self.ui
+        ui.post(lambda: ui.show_alert(f"{key.upper()} PROTOCOL ENGAGED", "info"))
+        self.say(f"Initiating {key} protocol, {self.title}.")
+        lines = []
+        for cmd in cmds:
+            try:
+                r = self.parser.parse(cmd)
+            except Exception as e:
+                r = f"error: {e}"
+            lines.append(f"• {cmd}  →  {(r or 'not a device command, skipped').splitlines()[0]}")
+            time.sleep(0.5)
+        ui.post(lambda: ui.add_assistant(f"{key.title()} protocol:\n" + "\n".join(lines)))
+        chime("done", self.cfg)
+        if self.cfg.get("speak_replies", True):
+            self.tts.speak(f"{key.title()} protocol complete.")
+        return True
+
     def _handle(self, text):
         c = normalize(text).lower()
+        ui = self.ui
 
         if RE_EXIT.fullmatch(c):
-            self.say("Signing off, sir. Have a good one.")
-            time.sleep(2.2)
-            self.ui.post(self.ui.quit)
+            self.say(f"Signing off, {self.title}. Have a good one.")
+            time.sleep(2.6)
+            ui.post(ui.quit)
             return
         if RE_CLEAR.fullmatch(c):
             self.memory.clear()
-            self.ui.post(self.ui.clear_chat)
-            self.say("Memory cleared, sir.")
+            ui.post(ui.clear_chat)
+            self.say(f"Memory cleared, {self.title}.")
             return
+        for pat, resp in SMALLTALK:
+            if re.fullmatch(pat, c):
+                out = resp(self) if callable(resp) else random.choice(resp).format(t=self.title)
+                self.say(out)
+                return
         if RE_TIME.fullmatch(c):
-            self.say(f"It's {datetime.datetime.now():%H:%M}, sir.")
+            self.say(f"It's {speak_time(datetime.datetime.now())}, {self.title}.")
             return
         if RE_DATE.fullmatch(c):
-            self.say(f"Today is {datetime.datetime.now():%A, %d %B %Y}.")
+            now = datetime.datetime.now()
+            self.say(f"Today is {now:%A}, the {ordinal(now.day)} of {now:%B}, {now.year}.")
+            return
+        if RE_BRIEF.fullmatch(c):
+            ui.post(lambda: ui.set_status("Compiling briefing…"))
+            self.say(self.briefing())
+            return
+        if RE_WEATHER.fullmatch(c):
+            self.say(self._weather_reply(c))
+            return
+        if self._timer_cmd(c):
+            return
+        if RE_PROTO_LIST.fullmatch(c):
+            names = list((self.cfg.get("protocols") or {}).keys())
+            self.say(f"Available protocols: {', '.join(names)}." if names else "No protocols are configured.")
+            return
+        if RE_HOLO.fullmatch(c):
+            ui.post(ui.enter_holo)
+            self.say("Switching to holographic mode.")
+            return
+        if RE_UNHOLO.fullmatch(c):
+            ui.post(ui.exit_holo)
+            self.say(f"Right here, {self.title}.")
+            return
+        if RE_MIC_MUTE.fullmatch(c):
+            ui.post(lambda: ui.set_mic_muted(True))
+            self.say("Microphone muted. Type, or tap the mic, when you need me.")
+            return
+        m = RE_PROTO.fullmatch(c)
+        if m and self._run_protocol(m.group(1) or m.group(2) or ""):
             return
         if RE_VISION.fullmatch(c):
-            self.ui.post(lambda: self.ui.set_status("Analysing screen…"))
+            ui.post(lambda: ui.set_status("Analysing screen…"))
             self.say(self.vision.analyze_screen())
             return
 
         result = self.parser.parse(text)
         if result is not None:
-            self.ui.post(lambda: self.ui.add_assistant(result))
+            ui.post(lambda: ui.add_assistant(result))
             if self.cfg.get("speak_replies", True):
-                first = result.splitlines()[0] if result else ""
-                self.tts.speak(first[:220])
+                self.tts.speak((result.splitlines()[0] if result else "")[:220])
             return
 
-        # AI (streamed into the chat)
-        self.ui.post(self.ui.assistant_begin)
-        full = self.brain.reply_stream(text, lambda p: self.ui.post(lambda p=p: self.ui.assistant_token(p)))
-        self.ui.post(self.ui.assistant_end)
-        if self.cfg.get("speak_replies", True):
-            self.tts.speak(full)
+        # AI — streamed into the chat and spoken sentence by sentence
+        ui.post(ui.assistant_begin)
+        feeder = _SentenceFeeder(self.tts.speak if self.cfg.get("speak_replies", True) else (lambda s: None),
+                                 self.title)
+
+        def on_tok(p):
+            ui.post(lambda p=p: ui.assistant_token(p))
+            feeder.feed(p)
+
+        self.brain.reply_stream(text, on_tok)
+        feeder.finish()
+        ui.post(ui.assistant_end)
 
 
 # ══════════════════════════════════════════════════════════════════
-# UI  — HUD
+# UI — holographic HUD
 # ══════════════════════════════════════════════════════════════════
 
 class C:
-    BG = "#05080f"
-    PANEL = "#0a111e"
-    PANEL2 = "#0f1a2c"
-    LINE = "#18263d"
-    LINE2 = "#22385a"
-    CYAN = "#38bdf8"
-    CYAN_HI = "#7dd3fc"
-    TEAL = "#22d3ee"
-    GREEN = "#34d399"
-    AMBER = "#fbbf24"
-    RED = "#f87171"
-    VIOLET = "#a78bfa"
-    TEXT = "#dbeafe"
-    SOFT = "#94a3b8"
-    MUTED = "#55657d"
-    WHITE = "#f0f9ff"
+    BG = "#03070d"
+    PANEL = "#07111d"
+    PANEL2 = "#0c1a2b"
+    LINE = "#13283e"
+    LINE2 = "#1f4060"
+    CYAN = "#33d1ff"
+    CYAN_HI = "#9beaff"
+    TEAL = "#2ee6d6"
+    GOLD = "#f5b942"
+    ORANGE = "#ff8a3d"
+    RED = "#ff4d5e"
+    GREEN = "#3ee8a0"
+    VIOLET = "#9b8cff"
+    TEXT = "#d7ecff"
+    SOFT = "#8aa4bf"
+    MUTED = "#4f6680"
+    WHITE = "#f2fbff"
 
 
 F_HEAD = "Bahnschrift"          # ships with Windows 10/11; Tk falls back if missing
 F_BODY = "Segoe UI"
 F_MONO = "Consolas"
+
+MODE_STYLE = {
+    "boot":   ("INITIALISING", C.VIOLET),
+    "idle":   ("STANDBY", C.CYAN),
+    "listen": ("LISTENING", C.GREEN),
+    "think":  ("PROCESSING", C.GOLD),
+    "speak":  ("SPEAKING", C.CYAN_HI),
+    "muted":  ("MIC MUTED", C.MUTED),
+    "error":  ("MIC OFFLINE", C.RED),
+}
 
 
 def blend(c1, c2, t):
@@ -1753,15 +2624,76 @@ def level_norm(rms):
     return max(0.0, min(1.0, (db + 58) / 46))
 
 
-MODE_STYLE = {
-    "boot":   ("INITIALISING", C.VIOLET),
-    "idle":   ("STANDBY", C.CYAN),
-    "listen": ("LISTENING", C.GREEN),
-    "think":  ("PROCESSING", C.AMBER),
-    "speak":  ("SPEAKING", C.CYAN_HI),
-    "muted":  ("MIC MUTED", C.MUTED),
-    "error":  ("MIC OFFLINE", C.RED),
-}
+def _hexagon(cx, cy, r, rot_deg=0.0):
+    pts = []
+    for i in range(6):
+        a = math.radians(60 * i + rot_deg)
+        pts += [cx + r * math.cos(a), cy - r * math.sin(a)]
+    return pts
+
+
+def draw_holo_core(c, cx, cy, R, acc, lv, ang, ph, mode, S, rich=True, tag="dyn"):
+    """The animated holographic core — shared by the main HUD and the floating orb."""
+    T = tag
+    cos, sin, rad = math.cos, math.sin, math.radians
+
+    for rr, t in ((1.0, 0.035), (0.8, 0.05), (0.58, 0.07 + 0.08 * lv)):
+        r = R * rr
+        c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=blend(C.BG, acc, t), outline="", tags=T)
+
+    # level ticks — light up symmetrically from 12 o'clock with the mic / voice level
+    n = 72 if rich else 48
+    lit = n * lv
+    dim = blend(C.BG, acc, 0.22)
+    for i in range(n):
+        a = rad(90 - i * 360 / n)
+        long = i % 6 == 0
+        r1, r2 = R * (0.89 if long else 0.925), R * 0.965
+        on = min(i, n - i) < lit / 2
+        c.create_line(cx + r1 * cos(a), cy - r1 * sin(a), cx + r2 * cos(a), cy - r2 * sin(a),
+                      fill=acc if on else dim, width=S(2) if long else 1, tags=T)
+
+    r = R * 0.83
+    for k in range(3):
+        c.create_arc(cx - r, cy - r, cx + r, cy + r, start=ang + k * 120, extent=76, style="arc",
+                     outline=acc, width=S(3), tags=T)
+    r = R * 0.765
+    gold = blend(C.BG, C.GOLD, 0.85)
+    for k in range(6):
+        c.create_arc(cx - r, cy - r, cx + r, cy + r, start=-ang * 0.6 + k * 60, extent=20, style="arc",
+                     outline=gold, width=S(2), tags=T)
+
+    base = (ang * 2.4) % 360                                   # radar sweep
+    for k in range(7):
+        a = rad(base - k * 3.5)
+        c.create_line(cx + R * 0.44 * cos(a), cy - R * 0.44 * sin(a), cx + R * 0.7 * cos(a), cy - R * 0.7 * sin(a),
+                      fill=blend(C.BG, acc, 0.75 * (1 - k / 7)), width=S(2) if k == 0 else 1, tags=T)
+
+    r = R * 0.62
+    c.create_oval(cx - r, cy - r, cx + r, cy + r, outline=blend(C.BG, acc, 0.45), dash=(2, 5), tags=T)
+    for k in range(3):
+        a = rad(-ang * 1.3 + k * 120)
+        tip = (cx + (r - S(8)) * cos(a), cy - (r - S(8)) * sin(a))
+        p1 = (cx + r * cos(a + 0.07), cy - r * sin(a + 0.07))
+        p2 = (cx + r * cos(a - 0.07), cy - r * sin(a - 0.07))
+        c.create_polygon(*tip, *p1, *p2, fill=acc, outline="", tags=T)
+
+    c.create_polygon(_hexagon(cx, cy, R * 0.42, ang * 0.25), fill=C.PANEL if rich else blend(C.BG, acc, 0.1),
+                     outline=acc, width=S(2), tags=T)
+    c.create_polygon(_hexagon(cx, cy, R * 0.31, 30 - ang * 0.5), fill="", outline=blend(C.BG, acc, 0.5), tags=T)
+
+    pulse = 0.5 + 0.5 * math.sin(ph * 1.6)
+    core = R * (0.1 + 0.02 * pulse + 0.1 * lv)
+    for k, t in ((2.0, 0.2), (1.5, 0.45), (1.0, 1.0)):
+        rr = core * k
+        c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, fill=blend(C.PANEL, acc, t), outline="", tags=T)
+    rr = core * 0.42
+    c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, fill=C.WHITE, outline="", tags=T)
+
+    if mode == "think":
+        r = R * 0.9
+        c.create_arc(cx - r, cy - r, cx + r, cy + r, start=-ang * 2, extent=46, style="arc",
+                     outline=C.WHITE, width=S(2), tags=T)
 
 
 class FlatButton(tk.Label):
@@ -1797,6 +2729,191 @@ class Pill(tk.Frame):
         self.dot.itemconfig(self._d, fill=color)
 
 
+class BootOverlay:
+    """Full-window boot sequence that reports the real start-up checks."""
+    TOTAL = 4
+
+    def __init__(self, hud):
+        self.hud = hud
+        self.cv = tk.Canvas(hud.root, bg=C.BG, highlightthickness=0)
+        self.cv.place(x=0, y=0, relwidth=1, relheight=1)
+        self.cv.tk.call("raise", self.cv._w)
+        self.mono = tkfont.Font(family=F_MONO, size=9)
+        self.t0 = time.monotonic()
+        self.steps = []
+        self.done_at = None
+        self._p = 0.0
+
+    def step(self, label, value, ok):
+        if not any(s[0] == label for s in self.steps):
+            self.steps.append((label, str(value), ok, time.monotonic()))
+
+    def tick(self):
+        S, c = self.hud.S, self.cv
+        now = time.monotonic()
+        t = now - self.t0
+        c.delete("all")
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 100 or h < 100:
+            return
+        cx, cy = w / 2, h * 0.34
+        R = min(w, h) * 0.16
+
+        for k, (rr, col, wd, d) in enumerate(((1.0, C.CYAN, 3, 1), (0.84, C.GOLD, 2, -1),
+                                             (0.68, C.CYAN, 1, 1), (1.14, C.LINE2, 1, -1))):
+            p = max(0.0, min(1.0, (t - 0.12 * k) / 1.1))
+            if p > 0:
+                r = R * rr
+                c.create_arc(cx - r, cy - r, cx + r, cy + r, start=90 + d * t * 40, extent=-359.9 * p,
+                             style="arc", outline=col, width=S(wd))
+        n = 60
+        for i in range(int(n * min(1.0, t / 1.8))):
+            a = math.radians(90 - i * 6)
+            r1, r2 = R * 1.22, R * (1.3 if i % 5 == 0 else 1.26)
+            c.create_line(cx + r1 * math.cos(a), cy - r1 * math.sin(a), cx + r2 * math.cos(a),
+                          cy - r2 * math.sin(a), fill=blend(C.BG, C.CYAN, 0.5))
+        grow = min(1.0, t / 0.8)
+        pulse = 0.5 + 0.5 * math.sin(t * 5)
+        core = R * (0.16 + 0.04 * pulse) * grow
+        if core > 1:
+            for k, tt in ((2.2, 0.15), (1.5, 0.4), (1.0, 1.0)):
+                rr = core * k
+                c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, fill=blend(C.BG, C.CYAN, tt), outline="")
+            rr = core * 0.45
+            c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, fill=C.WHITE, outline="")
+            c.create_polygon(_hexagon(cx, cy, R * 0.42, t * 20), fill="", outline=blend(C.BG, C.CYAN, 0.7),
+                             width=S(2))
+
+        title = "J.A.R.V.I.S."
+        k = int(len(title) * max(0.0, min(1.0, (t - 0.4) / 0.9)))
+        ty = cy + R * 1.42 + S(26)
+        c.create_text(cx, ty, text=title[:k], fill=C.WHITE, font=(F_HEAD, 28, "bold"))
+        if t > 1.2:
+            c.create_text(cx, ty + S(32), text="PERSONAL AI SYSTEM  ·  BOOT SEQUENCE", fill=C.MUTED, font=(F_HEAD, 9))
+
+        bw = S(520)
+        bx, by = cx - bw / 2, ty + S(62)
+        self._p += (len(self.steps) / self.TOTAL - self._p) * 0.15
+        c.create_rectangle(bx, by, bx + bw, by + S(3), fill=C.LINE, outline="")
+        c.create_rectangle(bx, by, bx + bw * self._p, by + S(3), fill=C.CYAN, outline="")
+        c.create_text(bx + bw, by - S(5), text=f"{int(self._p * 100 + 0.5):3d}%", anchor="se", fill=C.CYAN,
+                      font=(F_MONO, 9))
+
+        y = by + S(20)
+        for label, value, ok, at in self.steps:
+            head = f"{label:<18}{'·' * 12}  "
+            shown = int((now - at) * 150)
+            c.create_text(bx, y, text=head[:shown], anchor="nw", fill=C.SOFT, font=self.mono)
+            if shown > len(head):
+                c.create_text(bx + self.mono.measure(head), y, text=value[:shown - len(head)], anchor="nw",
+                              fill=C.GREEN if ok else C.RED, font=self.mono)
+            y += S(19)
+        if len(self.steps) < self.TOTAL and int(t * 3) % 2 == 0:
+            c.create_text(bx, y, text="▌", anchor="nw", fill=C.CYAN, font=self.mono)
+
+        if self.done_at is None and ((len(self.steps) >= self.TOTAL and t > 2.6) or t > 8.0):
+            self.done_at = now
+        if self.done_at and now - self.done_at > 0.9:
+            self.finish()
+
+    def finish(self):
+        try:
+            self.cv.destroy()
+        except Exception:
+            pass
+        if self.hud.boot is self:
+            self.hud.boot = None
+            self.hud.on_boot_overlay_done()
+
+
+class HoloOrb(tk.Toplevel):
+    """Floating, always-on-top, transparent holographic orb (F11 / "go holographic")."""
+    KEY = "#010203"
+
+    def __init__(self, hud):
+        super().__init__(hud.root)
+        self.hud = hud
+        S = hud.S
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        bg = self.KEY
+        try:
+            self.attributes("-transparentcolor", self.KEY)
+        except tk.TclError:
+            bg = C.BG
+        self.W, self.H = S(220), S(300)
+        self.cv = tk.Canvas(self, width=self.W, height=self.H, bg=bg, highlightthickness=0, cursor="hand2")
+        self.cv.pack()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        x, y = hud.cfg.get("holo_x"), hud.cfg.get("holo_y")
+        if not (isinstance(x, int) and isinstance(y, int) and 0 <= x < sw - 40 and 0 <= y < sh - 40):
+            x, y = sw - self.W - S(24), sh - self.H - S(64)
+        self.geometry(f"{self.W}x{self.H}+{x}+{y}")
+        self._drag, self._moved, self._click_job = None, False, None
+        self.cv.bind("<ButtonPress-1>", self._press)
+        self.cv.bind("<B1-Motion>", self._motion)
+        self.cv.bind("<ButtonRelease-1>", self._release)
+        self.cv.bind("<Double-Button-1>", self._double)
+        self.cv.bind("<Button-3>", self._menu)
+        self.bind("<Escape>", lambda e: hud.assistant.tts.stop())
+        self.menu = tk.Menu(self, tearoff=0, bg=C.PANEL2, fg=C.TEXT, activebackground=C.LINE2,
+                            activeforeground=C.WHITE, bd=0, font=(F_BODY, 9))
+        self.menu.add_command(label="Talk   (Ctrl+Alt+J)", command=hud.push_to_talk)
+        self.menu.add_command(label="Stop speaking", command=lambda: hud.assistant.tts.stop())
+        self.menu.add_command(label="Mute / unmute mic", command=hud.toggle_mute)
+        self.menu.add_command(label="Restore full HUD", command=hud.exit_holo)
+        self.menu.add_separator()
+        self.menu.add_command(label="Quit J.A.R.V.I.S.", command=hud.quit)
+
+    def _press(self, e):
+        self._drag = (e.x_root, e.y_root, self.winfo_x(), self.winfo_y())
+        self._moved = False
+
+    def _motion(self, e):
+        if not self._drag:
+            return
+        dx, dy = e.x_root - self._drag[0], e.y_root - self._drag[1]
+        if abs(dx) + abs(dy) > 4:
+            self._moved = True
+        if self._moved:
+            self.geometry(f"+{self._drag[2] + dx}+{self._drag[3] + dy}")
+
+    def _release(self, e):
+        if self._moved:
+            self.hud.cfg["holo_x"], self.hud.cfg["holo_y"] = self.winfo_x(), self.winfo_y()
+            save_config(self.hud.cfg)
+        else:
+            if self._click_job:
+                self.after_cancel(self._click_job)
+            self._click_job = self.after(280, self._single)
+        self._drag = None
+
+    def _single(self):
+        self._click_job = None
+        self.hud.push_to_talk()
+
+    def _double(self, e):
+        if self._click_job:
+            self.after_cancel(self._click_job)
+            self._click_job = None
+        self.hud.exit_holo()
+
+    def _menu(self, e):
+        self.menu.tk_popup(e.x_root, e.y_root)
+
+    def draw(self):
+        h, c, S = self.hud, self.cv, self.hud.S
+        c.delete("all")
+        cx = cy = self.W / 2
+        R = self.W / 2 - S(8)
+        acc = h._accent()
+        draw_holo_core(c, cx, cy, R, acc, h.smooth, h.angle, h.phase, h.mode, S, rich=False, tag="d")
+        c.create_text(cx, self.W + S(12), text=MODE_STYLE[h.mode][0], fill=acc, font=(F_HEAD, 10, "bold"))
+        line = h.lbl_status.cget("text") if h.mode in ("listen", "think") else (h._last_line or h.lbl_status.cget("text"))
+        c.create_text(cx, self.W + S(28), text=line[:120], fill=C.TEXT, font=(F_BODY, 8),
+                      width=self.W - S(14), anchor="n", justify="center")
+
+
 class HUD:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1814,11 +2931,20 @@ class HUD:
         self.smooth = 0.0
         self._net = None
         self._streaming = False
+        self._stream_buf = ""
+        self._stats = {"CPU": 0.0, "RAM": 0.0, "DISK": 0.0}
+        self._brk = []
+        self._rg = None
+        self._mic_booted = False
+        self._last_line = ""
+        self._alert_job = None
+        self.boot = None
+        self.orb = None
 
         root.title("J.A.R.V.I.S.")
         root.configure(bg=C.BG)
-        root.geometry(f"{S(1260)}x{S(800)}")
-        root.minsize(S(1020), S(660))
+        root.geometry(f"{S(1320)}x{S(860)}")
+        root.minsize(S(1080), S(700))
         self._style()
         self._build()
 
@@ -1829,12 +2955,19 @@ class HUD:
         root.bind("<F2>", lambda e: self.push_to_talk())
         root.bind("<Control-space>", lambda e: self.push_to_talk())
         root.bind("<Escape>", lambda e: self.assistant.tts.stop())
+        root.bind("<F11>", lambda e: self.enter_holo())
+        start_global_hotkey(lambda: self.post(self.push_to_talk))
 
+        if self.cfg.get("boot_sequence", True):
+            self.boot = BootOverlay(self)
         self._pump()
         self._animate()
         self._tick_clock()
         self._tick_stats()
+        self.root.after(80, lambda: [b.lift() for b in self._brk])
         threading.Thread(target=self.assistant.boot, daemon=True, name="boot").start()
+        if not self.boot:
+            self.root.after(1800, self.on_boot_overlay_done)
 
     # ── thread-safe UI calls ──────────────────────────────────────
     def post(self, fn):
@@ -1842,7 +2975,7 @@ class HUD:
 
     def _pump(self):
         try:
-            for _ in range(80):
+            for _ in range(100):
                 fn = self._q.get_nowait()
                 try:
                     fn()
@@ -1874,6 +3007,15 @@ class HUD:
         self.root.option_add("*TCombobox*Listbox.selectBackground", C.LINE2)
         self.root.option_add("*TCombobox*Listbox.font", (F_BODY, 9))
 
+    def _brackets(self, w, col, L=14, t=2):
+        S = self.S
+        L, t = S(L), max(1, S(t))
+        for relx, rely, anc in ((0, 0, "nw"), (1, 0, "ne"), (0, 1, "sw"), (1, 1, "se")):
+            for ww, hh in ((L, t), (t, L)):
+                f = tk.Frame(w, bg=col, width=ww, height=hh)
+                f.place(relx=relx, rely=rely, anchor=anc)
+                self._brk.append(f)
+
     def _panel(self, parent, title, accent=C.CYAN):
         S = self.S
         f = tk.Frame(parent, bg=C.PANEL, highlightthickness=1, highlightbackground=C.LINE)
@@ -1881,25 +3023,29 @@ class HUD:
         head.pack(fill="x", padx=S(14), pady=(S(12), S(6)))
         tk.Frame(head, bg=accent, width=S(3), height=S(14)).pack(side="left")
         tk.Label(head, text=title, font=(F_HEAD, 9, "bold"), fg=C.SOFT, bg=C.PANEL).pack(side="left", padx=S(8))
-        f.head = head
+        self._brackets(f, accent)
         return f
+
+    def _sub(self, p, title, accent):
+        S = self.S
+        tk.Frame(p, bg=C.LINE, height=1).pack(fill="x", padx=S(14), pady=(S(10), S(8)))
+        head = tk.Frame(p, bg=C.PANEL)
+        head.pack(fill="x", padx=S(14), pady=(0, S(6)))
+        tk.Frame(head, bg=accent, width=S(3), height=S(14)).pack(side="left")
+        tk.Label(head, text=title, font=(F_HEAD, 9, "bold"), fg=C.SOFT, bg=C.PANEL).pack(side="left", padx=S(8))
 
     # ── layout ────────────────────────────────────────────────────
     def _build(self):
         S = self.S
-        # Header ---------------------------------------------------
         hdr = tk.Frame(self.root, bg=C.BG)
         hdr.pack(fill="x", padx=S(20), pady=(S(14), S(8)))
 
-        logo = tk.Canvas(hdr, width=S(38), height=S(38), bg=C.BG, highlightthickness=0)
+        logo = tk.Canvas(hdr, width=S(40), height=S(40), bg=C.BG, highlightthickness=0)
         logo.pack(side="left")
-        cx = cy = S(19)
-        pts = []
-        for i in range(6):
-            a = math.radians(60 * i - 90)
-            pts += [cx + S(17) * math.cos(a), cy + S(17) * math.sin(a)]
-        logo.create_polygon(pts, outline=C.CYAN, fill=C.PANEL2, width=S(2))
-        logo.create_oval(cx - S(6), cy - S(6), cx + S(6), cy + S(6), fill=C.CYAN_HI, outline="")
+        cx = cy = S(20)
+        logo.create_polygon(_hexagon(cx, cy, S(18), 30), outline=C.CYAN, fill=C.PANEL2, width=S(2))
+        logo.create_polygon(_hexagon(cx, cy, S(10), 0), outline=C.GOLD, fill="", width=1)
+        logo.create_oval(cx - S(4), cy - S(4), cx + S(4), cy + S(4), fill=C.CYAN_HI, outline="")
 
         tb = tk.Frame(hdr, bg=C.BG)
         tb.pack(side="left", padx=S(12))
@@ -1914,6 +3060,15 @@ class HUD:
         self.lbl_date = tk.Label(clock, text="", font=(F_HEAD, 8), fg=C.MUTED, bg=C.BG)
         self.lbl_date.pack(anchor="e")
 
+        tk.Frame(hdr, bg=C.LINE2, width=1, height=S(34)).pack(side="right", padx=S(16))
+        wx = tk.Frame(hdr, bg=C.BG)
+        wx.pack(side="right")
+        self.lbl_wx = tk.Label(wx, text="—", font=(F_HEAD, 18), fg=C.GOLD, bg=C.BG)
+        self.lbl_wx.pack(anchor="e")
+        self.lbl_wx_sub = tk.Label(wx, text=(self.cfg.get("city") or "").upper(), font=(F_HEAD, 8),
+                                   fg=C.MUTED, bg=C.BG)
+        self.lbl_wx_sub.pack(anchor="e")
+
         pills = tk.Frame(hdr, bg=C.BG)
         pills.pack(side="right", padx=S(18))
         self.pill_mode = Pill(pills, "STATE", S)
@@ -1921,22 +3076,21 @@ class HUD:
         self.pill_ai = Pill(pills, "AI", S)
         for p in (self.pill_ai, self.pill_mic, self.pill_mode):
             p.pack(side="right", padx=S(4))
-        self.pill_ai.set("checking…", C.AMBER)
-        self.pill_mic.set("starting…", C.AMBER)
+        self.pill_ai.set("checking…", C.GOLD)
+        self.pill_mic.set("starting…", C.GOLD)
 
         line = tk.Canvas(self.root, height=S(2), bg=C.BG, highlightthickness=0)
         line.pack(fill="x", padx=S(20))
         line.bind("<Configure>", lambda e: self._gradient_line(line, e.width))
 
-        # Body -----------------------------------------------------
         body = tk.Frame(self.root, bg=C.BG)
         body.pack(fill="both", expand=True, padx=S(20), pady=S(12))
-        body.grid_columnconfigure(0, minsize=S(260), weight=0)
+        body.grid_columnconfigure(0, minsize=S(270), weight=0)
         body.grid_columnconfigure(1, weight=1)
-        body.grid_columnconfigure(2, minsize=S(400), weight=0)
+        body.grid_columnconfigure(2, minsize=S(410), weight=0)
         body.grid_rowconfigure(0, weight=1)
 
-        left = self._panel(body, "SYSTEM DIAGNOSTICS")
+        left = self._panel(body, "DIAGNOSTICS")
         left.grid(row=0, column=0, sticky="nsew")
         self._build_left(left)
 
@@ -1944,11 +3098,10 @@ class HUD:
         center.grid(row=0, column=1, sticky="nsew", padx=S(14))
         self._build_center(center)
 
-        right = self._panel(body, "CONVERSATION", accent=C.GREEN)
+        right = self._panel(body, "CONVERSATION", accent=C.GOLD)
         right.grid(row=0, column=2, sticky="nsew")
         self._build_chat(right)
 
-        # Footer ---------------------------------------------------
         self._build_footer()
 
     def _gradient_line(self, cv, w):
@@ -1956,95 +3109,89 @@ class HUD:
         n = 60
         for i in range(n):
             t = 1 - abs(i - n / 2) / (n / 2)
-            cv.create_rectangle(i * w / n, 0, (i + 1) * w / n + 1, self.S(2),
-                                fill=blend(C.BG, C.CYAN, t * 0.9), outline="")
+            col = blend(C.BG, C.GOLD if 26 <= i <= 33 else C.CYAN, t * 0.9)
+            cv.create_rectangle(i * w / n, 0, (i + 1) * w / n + 1, self.S(2), fill=col, outline="")
 
     def _build_left(self, p):
         S = self.S
-        self.gauges = tk.Canvas(p, width=S(230), height=S(112), bg=C.PANEL, highlightthickness=0)
-        self.gauges.pack(fill="x", padx=S(10), pady=(S(4), S(6)))
-        self._gauge_vals = {"CPU": 0, "RAM": 0, "DISK": 0}
+        self.gauges = tk.Canvas(p, width=S(240), height=S(104), bg=C.PANEL, highlightthickness=0)
+        self.gauges.pack(fill="x", padx=S(10), pady=(S(2), S(4)))
 
         grid = tk.Frame(p, bg=C.PANEL)
         grid.pack(fill="x", padx=S(14))
         self.metrics = {}
-        for i, key in enumerate(("BATTERY", "NET ↓", "NET ↑", "UPTIME", "PROCESSES")):
-            tk.Label(grid, text=key, font=(F_HEAD, 8), fg=C.MUTED, bg=C.PANEL).grid(row=i, column=0, sticky="w", pady=S(3))
+        for i, key in enumerate(("BATTERY", "NET ↓", "NET ↑", "UPTIME")):
+            tk.Label(grid, text=key, font=(F_HEAD, 8), fg=C.MUTED, bg=C.PANEL).grid(row=i, column=0, sticky="w", pady=S(2))
             v = tk.Label(grid, text="—", font=(F_MONO, 9), fg=C.TEXT, bg=C.PANEL)
-            v.grid(row=i, column=1, sticky="e", pady=S(3))
+            v.grid(row=i, column=1, sticky="e", pady=S(2))
             self.metrics[key] = v
         grid.grid_columnconfigure(1, weight=1)
 
-        tk.Frame(p, bg=C.LINE, height=1).pack(fill="x", padx=S(14), pady=S(12))
-        head = tk.Frame(p, bg=C.PANEL)
-        head.pack(fill="x", padx=S(14), pady=(0, S(8)))
-        tk.Frame(head, bg=C.AMBER, width=S(3), height=S(14)).pack(side="left")
-        tk.Label(head, text="QUICK ACTIONS", font=(F_HEAD, 9, "bold"), fg=C.SOFT, bg=C.PANEL).pack(side="left", padx=S(8))
+        self._sub(p, "PROTOCOLS", C.GOLD)
+        pr = tk.Frame(p, bg=C.PANEL)
+        pr.pack(fill="x", padx=S(12))
+        for i, name in enumerate(list((self.cfg.get("protocols") or {}).keys())[:6]):
+            b = FlatButton(pr, name.upper(), lambda n=name: self.assistant.submit(f"activate {n} protocol", "button"),
+                           fg=C.GOLD, font=(F_HEAD, 8, "bold"), pady=S(6))
+            b.grid(row=i // 2, column=i % 2, sticky="ew", padx=S(2), pady=S(2))
+        pr.grid_columnconfigure(0, weight=1)
+        pr.grid_columnconfigure(1, weight=1)
 
+        self._sub(p, "QUICK ACTIONS", C.CYAN)
         qa = tk.Frame(p, bg=C.PANEL)
         qa.pack(fill="x", padx=S(12))
-        actions = [("Screenshot", "take a screenshot"), ("Scan screen", "what's on my screen"),
-                   ("Status", "system status"), ("Downloads", "open downloads"),
-                   ("Mute audio", "mute"), ("Lock PC", "lock")]
-        for i, (label, cmd) in enumerate(actions):
-            b = FlatButton(qa, label, lambda c=cmd: self.assistant.submit(c, "button"),
-                           font=(F_BODY, 9), pady=S(6))
+        for i, (label, cmd) in enumerate((("Briefing", "daily briefing"), ("Weather", "what's the weather"),
+                                          ("Screenshot", "take a screenshot"), ("Scan screen", "what's on my screen"))):
+            b = FlatButton(qa, label, lambda c=cmd: self.assistant.submit(c, "button"), font=(F_BODY, 9), pady=S(6))
             b.grid(row=i // 2, column=i % 2, sticky="ew", padx=S(2), pady=S(2))
         qa.grid_columnconfigure(0, weight=1)
         qa.grid_columnconfigure(1, weight=1)
 
-        tk.Frame(p, bg=C.LINE, height=1).pack(fill="x", padx=S(14), pady=S(12))
-        self.lbl_engine = tk.Label(p, text="", font=(F_MONO, 8), fg=C.MUTED, bg=C.PANEL,
-                                   justify="left", anchor="w")
-        self.lbl_engine.pack(fill="x", padx=S(14), pady=(0, S(12)))
-        self._refresh_engine_label()
-
-    def _refresh_engine_label(self):
-        ww = "on" if self.cfg.get("wake_word_enabled", True) else "off (always listening)"
-        self.lbl_engine.config(text=f"MODEL   {self.cfg['ai_model']}\n"
-                                    f"VISION  {self.cfg['vision_model']}\n"
-                                    f"WAKE    \"jarvis\" · {ww}\n"
-                                    f"STT     google · {self.cfg.get('stt_language')}")
+        self._sub(p, "TIMERS", C.GREEN)
+        self.lbl_timers = tk.Label(p, text="No active timers", font=(F_MONO, 9), fg=C.MUTED, bg=C.PANEL,
+                                   justify="left", anchor="nw")
+        self.lbl_timers.pack(fill="x", padx=S(16), pady=(0, S(10)))
 
     def _build_center(self, p):
         S = self.S
         self.reactor = tk.Canvas(p, width=S(300), height=S(300), bg=C.BG, highlightthickness=0)
         self.reactor.pack(fill="both", expand=True)
+        self.reactor.bind("<Configure>", self._reactor_static)
+        self.reactor.bind("<Button-1>", lambda e: self.push_to_talk())
 
         self.lbl_mode = tk.Label(p, text="INITIALISING", font=(F_HEAD, 15, "bold"), fg=C.VIOLET, bg=C.BG)
         self.lbl_mode.pack(pady=(S(4), 0))
-        self.lbl_status = tk.Label(p, text="Bringing systems online…", font=(F_BODY, 10),
-                                   fg=C.SOFT, bg=C.BG)
+        self.lbl_status = tk.Label(p, text="Bringing systems online…", font=(F_BODY, 10), fg=C.SOFT, bg=C.BG)
         self.lbl_status.pack(pady=(S(2), 0))
-        self.lbl_heard = tk.Label(p, text="", font=(F_BODY, 9, "italic"), fg=C.MUTED, bg=C.BG,
-                                  wraplength=S(460))
+        self.lbl_heard = tk.Label(p, text="", font=(F_BODY, 9, "italic"), fg=C.MUTED, bg=C.BG, wraplength=S(460))
         self.lbl_heard.pack(pady=(S(4), S(6)))
-
-        self.meter = tk.Canvas(p, width=S(300), height=S(54), bg=C.BG, highlightthickness=0)
+        self.meter = tk.Canvas(p, width=S(300), height=S(50), bg=C.BG, highlightthickness=0)
         self.meter.pack(fill="x", pady=(0, S(2)))
+
+        self.alert_lbl = tk.Label(p, text="", font=(F_HEAD, 10, "bold"), fg=C.RED, bg=C.BG, padx=S(16), pady=S(8),
+                                  highlightthickness=1, wraplength=S(520), justify="center")
 
     def _build_chat(self, p):
         S = self.S
         wrap = tk.Frame(p, bg=C.PANEL)
-        wrap.pack(fill="both", expand=True, padx=S(4), pady=(0, S(8)))
-        self.chat = tk.Text(wrap, width=1, height=1, bg=C.PANEL, fg=C.TEXT, bd=0, highlightthickness=0, wrap="word",
-                            font=(F_BODY, 10), padx=S(12), pady=S(4), cursor="arrow",
+        wrap.pack(fill="both", expand=True, padx=S(4), pady=(0, S(10)))
+        self.chat = tk.Text(wrap, width=1, height=1, bg=C.PANEL, fg=C.TEXT, bd=0, highlightthickness=0,
+                            wrap="word", font=(F_BODY, 10), padx=S(12), pady=S(4), cursor="arrow",
                             insertwidth=0, spacing1=S(1), spacing3=S(1))
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.chat.yview, style="J.Vertical.TScrollbar")
         self.chat.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.chat.pack(side="left", fill="both", expand=True)
-
         t = self.chat
-        t.tag_configure("who_user", foreground=C.GREEN, font=(F_HEAD, 9, "bold"), spacing1=S(12))
+        t.tag_configure("who_user", foreground=C.GOLD, font=(F_HEAD, 9, "bold"), spacing1=S(12))
         t.tag_configure("who_ai", foreground=C.CYAN, font=(F_HEAD, 9, "bold"), spacing1=S(12))
         t.tag_configure("meta", foreground=C.MUTED, font=(F_BODY, 8))
         t.tag_configure("msg_user", foreground=C.WHITE, lmargin1=S(2), lmargin2=S(2), spacing3=S(2))
         t.tag_configure("msg_ai", foreground=C.TEXT, lmargin1=S(2), lmargin2=S(2), spacing3=S(2))
+        t.tag_configure("msg_alert", foreground=C.GOLD, lmargin1=S(2), lmargin2=S(2), spacing3=S(2))
         t.tag_configure("code", foreground=C.CYAN_HI, font=(F_MONO, 9), background=C.PANEL2,
                         lmargin1=S(10), lmargin2=S(10))
-        t.tag_configure("sys", foreground=C.MUTED, font=(F_BODY, 8, "italic"), spacing1=S(8),
-                        justify="center")
+        t.tag_configure("sys", foreground=C.MUTED, font=(F_BODY, 8, "italic"), spacing1=S(8), justify="center")
         t.tag_configure("old", foreground=C.MUTED)
         t.config(state="disabled")
 
@@ -2052,10 +3199,10 @@ class HUD:
         S = self.S
         foot = tk.Frame(self.root, bg=C.PANEL, highlightthickness=1, highlightbackground=C.LINE)
         foot.pack(fill="x", padx=S(20), pady=(0, S(16)))
+        self._brackets(foot, C.CYAN, L=10)
         inner = tk.Frame(foot, bg=C.PANEL)
         inner.pack(fill="x", padx=S(12), pady=S(10))
 
-        # mic button (push-to-talk)
         self.micbtn = tk.Canvas(inner, width=S(46), height=S(46), bg=C.PANEL, highlightthickness=0, cursor="hand2")
         self.micbtn.pack(side="left")
         self.micbtn.bind("<Button-1>", lambda e: self.push_to_talk())
@@ -2064,21 +3211,22 @@ class HUD:
         box = tk.Frame(inner, bg=C.PANEL2, highlightthickness=1, highlightbackground=C.LINE2)
         box.pack(side="left", fill="x", expand=True, padx=S(12))
         tk.Label(box, text="›", font=(F_HEAD, 14, "bold"), fg=C.CYAN, bg=C.PANEL2).pack(side="left", padx=(S(10), 0))
-        self.entry = tk.Entry(box, bg=C.PANEL2, fg=C.WHITE, insertbackground=C.CYAN, bd=0, highlightthickness=0, width=10,
-                              font=(F_BODY, 11), relief="flat")
+        self.entry = tk.Entry(box, bg=C.PANEL2, fg=C.WHITE, insertbackground=C.CYAN, bd=0, highlightthickness=0,
+                              width=10, font=(F_BODY, 11), relief="flat")
         self.entry.pack(side="left", fill="x", expand=True, padx=S(8), ipady=S(8))
         self.entry.bind("<Return>", self._send)
         self.entry.bind("<FocusIn>", lambda e: box.config(highlightbackground=C.CYAN))
         self.entry.bind("<FocusOut>", lambda e: box.config(highlightbackground=C.LINE2))
-        self._placeholder = "Type a command or ask anything…   (F2 = talk, Esc = stop)"
+        self._placeholder = "Type a command or ask anything…   F2 / Ctrl+Alt+J talk · Esc stop · F11 holo"
         self._show_placeholder()
 
         FlatButton(inner, "SEND", self._send, bg=C.CYAN, fg=C.BG, hover=C.CYAN_HI,
                    font=(F_HEAD, 9, "bold"), padx=S(18), pady=S(9)).pack(side="left")
-        self.btn_mute = FlatButton(inner, "MUTE MIC", self.toggle_mute, font=(F_HEAD, 8, "bold"),
-                                   padx=S(12), pady=S(10))
+        self.btn_mute = FlatButton(inner, "MUTE MIC", self.toggle_mute, font=(F_HEAD, 8, "bold"), padx=S(12), pady=S(10))
         self.btn_mute.pack(side="left", padx=(S(8), 0))
         FlatButton(inner, "STOP", lambda: self.assistant.tts.stop(), font=(F_HEAD, 8, "bold"),
+                   padx=S(12), pady=S(10)).pack(side="left", padx=(S(6), 0))
+        FlatButton(inner, "◈ HOLO", self.enter_holo, fg=C.GOLD, font=(F_HEAD, 8, "bold"),
                    padx=S(12), pady=S(10)).pack(side="left", padx=(S(6), 0))
         FlatButton(inner, "⚙", self.open_settings, font=(F_BODY, 12), padx=S(12), pady=S(4)).pack(side="left", padx=(S(6), 0))
 
@@ -2097,14 +3245,12 @@ class HUD:
         S, c = self.S, self.micbtn
         c.delete("all")
         col = C.GREEN if self.flags["listening"] else (C.MUTED if self.assistant_muted() else C.CYAN)
-        fill = blend(C.PANEL, col, 0.18)
-        c.create_oval(S(2), S(2), S(44), S(44), fill=fill, outline=col, width=S(2))
+        c.create_oval(S(2), S(2), S(44), S(44), fill=blend(C.PANEL, col, 0.18), outline=col, width=S(2))
         x, y = S(23), S(23)
         c.create_rectangle(x - S(4), y - S(11), x + S(4), y + S(3), fill=col, outline=col)
         c.create_oval(x - S(4), y - S(14), x + S(4), y - S(7), fill=col, outline=col)
         c.create_oval(x - S(4), y - S(1), x + S(4), y + S(6), fill=col, outline=col)
-        c.create_arc(x - S(9), y - S(9), x + S(9), y + S(8), start=200, extent=140,
-                     style="arc", outline=col, width=S(2))
+        c.create_arc(x - S(9), y - S(9), x + S(9), y + S(8), start=200, extent=140, style="arc", outline=col, width=S(2))
         c.create_line(x, y + S(8), x, y + S(12), fill=col, width=S(2))
         if self.assistant_muted():
             c.create_line(x - S(11), y - S(11), x + S(11), y + S(11), fill=C.RED, width=S(2))
@@ -2143,6 +3289,31 @@ class HUD:
         self.set_status(self.idle_hint())
         self._refresh_mode()
 
+    def set_mic_muted(self, m):
+        if m != self.assistant.mic.muted:
+            self.toggle_mute()
+
+    def enter_holo(self):
+        if self.orb is not None or self.boot is not None:
+            return
+        self.orb = HoloOrb(self)
+        self.root.withdraw()
+
+    def exit_holo(self):
+        if self.orb is None:
+            return
+        try:
+            self.orb.destroy()
+        except Exception:
+            pass
+        self.orb = None
+        self.root.deiconify()
+        self.root.lift()
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+
     # ── state ─────────────────────────────────────────────────────
     def set_flag(self, name, value):
         self.flags[name] = value
@@ -2176,7 +3347,7 @@ class HUD:
         if self.flags["mic_error"]:
             return "Mic offline — type below, or pick a device in Settings."
         if self.cfg.get("wake_word_enabled", True):
-            return 'Say "Jarvis …"  ·  or tap the mic / press F2'
+            return 'Say "Jarvis …"  ·  tap the core / F2  ·  Ctrl+Alt+J from anywhere'
         return "Always listening — just speak."
 
     def set_status(self, text):
@@ -2186,20 +3357,30 @@ class HUD:
         self.lbl_heard.config(text=(f'heard: "{text}"  — no wake word' if ignored else f'"{text}"'),
                               fg=C.MUTED if ignored else C.SOFT)
 
-    def on_booted(self):
+    def boot_step(self, label, value, ok):
+        if self.boot:
+            self.boot.step(label, value, ok)
+
+    def on_boot_overlay_done(self):
         self.flags["ready"] = True
         self._refresh_mode()
         self.set_status(self.idle_hint())
+        self._reactor_static()
+        threading.Thread(target=self.assistant.greet, daemon=True, name="greet").start()
 
     def on_ai_status(self, online, msg):
         if online and not msg.startswith("missing"):
             self.pill_ai.set(self.cfg["ai_model"], C.GREEN)
         elif online:
-            self.pill_ai.set("model missing", C.AMBER)
+            self.pill_ai.set("model missing", C.GOLD)
             self.add_system(f"Ollama is running but {msg}. Run: ollama pull <model>")
         else:
             self.pill_ai.set("offline", C.RED)
             self.add_system("Ollama isn't reachable — PC commands still work. Start it with: ollama serve")
+
+    def on_weather(self, w):
+        self.lbl_wx.config(text=f"{w['icon']} {w['temp']}°C")
+        self.lbl_wx_sub.config(text=f"{w['city'].upper()}  ·  {w['desc'].upper()}")
 
     @staticmethod
     def _short(name, n=22):
@@ -2211,6 +3392,9 @@ class HUD:
         if not self.assistant.mic.muted:
             self.pill_mic.set(self._short(label), C.GREEN)
         self.add_system(f"Microphone: {label}")
+        if not self._mic_booted:
+            self._mic_booted = True
+            self.boot_step("AUDIO SENSORS", self._short(label, 30).upper(), True)
         self._refresh_mode()
         if self.flags["ready"]:
             self.set_status(self.idle_hint())
@@ -2221,8 +3405,36 @@ class HUD:
         self.pill_mic.set("error", C.RED)
         if first:
             self.add_system(f"Mic error: {msg}")
+        if not self._mic_booted:
+            self._mic_booted = True
+            self.boot_step("AUDIO SENSORS", "NO MICROPHONE", False)
         self._refresh_mode()
         self.set_status(self.idle_hint())
+
+    def show_alert(self, text, level="warn"):
+        col = C.RED if level == "warn" else C.GOLD
+        self.alert_lbl.config(text=f"▲  {text}", fg=col, bg=blend(C.BG, col, 0.12),
+                              highlightbackground=col, highlightcolor=col)
+        self.alert_lbl.place(relx=0.5, y=self.S(6), anchor="n")
+        self.alert_lbl.lift()
+        if self._alert_job:
+            self.root.after_cancel(self._alert_job)
+        self._alert_job = self.root.after(8000, self.alert_lbl.place_forget)
+
+    def refresh_timers(self):
+        act = self.assistant.timers.active()
+        if not act:
+            self.lbl_timers.config(text="No active timers", fg=C.MUTED)
+            return
+        rows = []
+        for rem, label, kind in act[:4]:
+            name = label or "timer"
+            if kind == "reminder":
+                name = "⏰ " + re.sub(r"^(to|that|about) ", "", name)
+            rows.append(f"{fmt_clock(rem):>7}  {name[:22]}")
+        if len(act) > 4:
+            rows.append(f"   +{len(act) - 4} more")
+        self.lbl_timers.config(text="\n".join(rows), fg=C.GREEN)
 
     # ── chat ──────────────────────────────────────────────────────
     def _chat_insert(self, *parts):
@@ -2241,14 +3453,17 @@ class HUD:
         self._chat_insert(("YOU", "who_user"), (f"   {datetime.datetime.now():%H:%M} · {src}\n", "meta"),
                           (text + "\n", "msg_user"))
 
-    def add_assistant(self, text):
-        self._chat_insert(("JARVIS", "who_ai"), (f"   {datetime.datetime.now():%H:%M}\n", "meta"))
-        self._insert_rich(text)
+    def add_assistant(self, text, alert=False):
+        self._chat_insert(("JARVIS", "who_ai"), (f"   {datetime.datetime.now():%H:%M}" + ("  · alert" if alert else "") + "\n", "meta"))
+        if alert:
+            self._chat_insert((text, "msg_alert"))
+        else:
+            self._insert_rich(text)
         self._chat_insert(("\n", "msg_ai"))
+        self._last_line = (text.strip().splitlines() or [""])[0][:160]
 
     def _insert_rich(self, text):
-        parts = re.split(r"(```.*?```)", text, flags=re.S)
-        for part in parts:
+        for part in re.split(r"(```.*?```)", text, flags=re.S):
             if part.startswith("```") and part.endswith("```"):
                 body = re.sub(r"^```[^\n]*\n?", "", part)[:-3]
                 self._chat_insert((body.rstrip() + "\n", "code"))
@@ -2274,12 +3489,13 @@ class HUD:
         if not self._streaming:
             return
         self._streaming = False
-        if "```" in self._stream_buf:                       # re-render with code styling
+        if "```" in self._stream_buf:
             self.chat.config(state="normal")
             self.chat.delete("stream_start", "end-1c")
             self.chat.config(state="disabled")
             self._insert_rich(self._stream_buf)
         self._chat_insert(("\n", "msg_ai"))
+        self._last_line = re.sub(r"```.*?```", "", self._stream_buf, flags=re.S).strip().split("\n")[0][:160]
 
     def add_system(self, text):
         self._chat_insert((f"— {text} —\n", "sys"))
@@ -2298,8 +3514,7 @@ class HUD:
         for h in hist:
             who = ("YOU", "who_user") if h["role"] == "user" else ("JARVIS", "who_ai")
             body = h["content"]
-            self._chat_insert(who, ("\n", "meta"),
-                              ((body[:400] + ("…" if len(body) > 400 else "")) + "\n", "old"))
+            self._chat_insert(who, ("\n", "meta"), ((body[:400] + ("…" if len(body) > 400 else "")) + "\n", "old"))
         self.add_system("now")
 
     # ── timers ────────────────────────────────────────────────────
@@ -2307,6 +3522,10 @@ class HUD:
         now = datetime.datetime.now()
         self.lbl_time.config(text=now.strftime("%H:%M:%S"))
         self.lbl_date.config(text=now.strftime("%A  ·  %d %B %Y").upper())
+        if getattr(self, "assistant", None) and self.assistant.timers.active():
+            self.refresh_timers()
+        elif self.lbl_timers.cget("fg") != C.MUTED:
+            self.refresh_timers()
         self.root.after(500, self._tick_clock)
 
     @staticmethod
@@ -2320,11 +3539,9 @@ class HUD:
     def _tick_stats(self):
         if HAS_PSUTIL:
             try:
-                self._gauge_vals = {
-                    "CPU": psutil.cpu_percent(interval=None),
-                    "RAM": psutil.virtual_memory().percent,
-                    "DISK": psutil.disk_usage(os.path.abspath(os.sep)).percent,
-                }
+                self._stats = {"CPU": psutil.cpu_percent(interval=None),
+                               "RAM": psutil.virtual_memory().percent,
+                               "DISK": psutil.disk_usage(os.path.abspath(os.sep)).percent}
                 bat = psutil.sensors_battery()
                 self.metrics["BATTERY"].config(
                     text=f"{bat.percent:.0f}% {'⚡' if bat.power_plugged else ''}" if bat else "AC")
@@ -2337,43 +3554,46 @@ class HUD:
                 self._net = (now, n.bytes_recv, n.bytes_sent)
                 up = int(time.time() - psutil.boot_time())
                 self.metrics["UPTIME"].config(text=f"{up // 86400}d {up % 86400 // 3600}h {up % 3600 // 60}m")
-                self.metrics["PROCESSES"].config(text=str(len(psutil.pids())))
             except Exception:
                 pass
-        self._draw_gauges()
+        if self.orb is None:
+            self._draw_gauges()
         self.root.after(1000, self._tick_stats)
 
     def _draw_gauges(self):
         S, c = self.S, self.gauges
         c.delete("all")
         w = max(c.winfo_width(), S(220))
-        r = S(30)
-        for i, (k, v) in enumerate(self._gauge_vals.items()):
-            cx = w * (i + 0.5) / 3
-            cy = S(44)
-            col = C.RED if v > 85 else C.AMBER if v > 65 else C.CYAN
-            c.create_arc(cx - r, cy - r, cx + r, cy + r, start=225, extent=-270, style="arc",
-                         outline=C.LINE, width=S(5))
+        r = S(29)
+        for i, (k, v) in enumerate(self._stats.items()):
+            cx, cy = w * (i + 0.5) / 3, S(42)
+            col = C.RED if v > 85 else C.GOLD if v > 65 else C.CYAN
+            c.create_arc(cx - r, cy - r, cx + r, cy + r, start=225, extent=-270, style="arc", outline=C.LINE, width=S(5))
             if v > 0.5:
-                c.create_arc(cx - r, cy - r, cx + r, cy + r, start=225, extent=-270 * v / 100,
-                             style="arc", outline=col, width=S(5))
+                c.create_arc(cx - r, cy - r, cx + r, cy + r, start=225, extent=-270 * v / 100, style="arc",
+                             outline=col, width=S(5))
             c.create_text(cx, cy, text=f"{v:.0f}", fill=C.WHITE, font=(F_HEAD, 13, "bold"))
             c.create_text(cx, cy + S(13), text="%", fill=C.MUTED, font=(F_HEAD, 7))
-            c.create_text(cx, cy + r + S(16), text=k, fill=C.SOFT, font=(F_HEAD, 8, "bold"))
+            c.create_text(cx, cy + r + S(15), text=k, fill=C.SOFT, font=(F_HEAD, 8, "bold"))
 
     # ── animation ────────────────────────────────────────────────
     def _animate(self):
-        lv = level_norm(self.assistant.mic.level) if self.assistant.mic.ok and not self.assistant_muted() else 0.0
+        mic = self.assistant.mic
+        lv = level_norm(mic.level) if mic.ok and not mic.muted else 0.0
         if self.mode == "speak":
             lv = max(lv, 0.35 + 0.35 * abs(math.sin(self.phase * 2.3)) * abs(math.sin(self.phase * 0.7 + 1)))
         self.smooth += (lv - self.smooth) * 0.35
         self.levels.append(self.smooth)
-        speed = {"think": 3.2, "listen": 1.8, "speak": 1.6}.get(self.mode, 0.8)
-        self.angle = (self.angle + speed) % 360
+        self.angle = (self.angle + {"think": 3.2, "listen": 1.8, "speak": 1.6}.get(self.mode, 0.8)) % 360
         self.phase += 0.08
         try:
-            self._draw_reactor()
-            self._draw_meter()
+            if self.boot:
+                self.boot.tick()
+            elif self.orb is not None:
+                self.orb.draw()
+            else:
+                self._draw_reactor()
+                self._draw_meter()
         except Exception as e:
             log(f"draw error: {e}")
         self.root.after(33, self._animate)
@@ -2383,81 +3603,89 @@ class HUD:
             return C.TEAL
         return MODE_STYLE[self.mode][1]
 
-    def _draw_reactor(self):
+    def _reactor_static(self, e=None):
         c, S = self.reactor, self.S
-        c.delete("all")
+        c.delete("static")
         w, h = c.winfo_width(), c.winfo_height()
-        if w < 50 or h < 50:
+        if w < 60 or h < 60:
+            self._rg = None
             return
         cx, cy = w / 2, h / 2
-        R = min(w, h) / 2 - S(12)
-        acc = self._accent()
-        lv = self.smooth
-        a0 = self.angle
+        R = min(w, h) / 2 - S(22)
+        room = S(140)
+        callouts = False
+        if w / 2 - R >= room:
+            callouts = True
+        elif w / 2 - room >= R * 0.66:
+            R, callouts = w / 2 - room, True
+        self._rg = (cx, cy, R, w, h, callouts)
 
-        # ambient glow
-        for i, (rr, t) in enumerate(((1.05, 0.04), (0.82, 0.06), (0.6, 0.08 + 0.06 * lv))):
-            r = R * rr
-            c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=blend(C.BG, acc, t), outline="")
+        s = S(19)
+        hh = s * math.sqrt(3)
+        far = math.hypot(w, h) / 2
+        for ci in range(int(w / (1.5 * s)) + 2):
+            for ri in range(int(h / hh) + 2):
+                x, y = ci * 1.5 * s, ri * hh + (hh / 2 if ci % 2 else 0)
+                d = math.hypot(x - cx, y - cy)
+                if d < R * 1.02:
+                    continue
+                t = 0.02 + 0.07 * max(0.0, 1 - d / far)
+                c.create_polygon(_hexagon(x, y, s * 0.9), outline=blend(C.BG, C.CYAN, t), fill="", tags="static")
 
-        # tick ring (lights up with mic level)
-        n = 90
-        lit = int(n * lv)
-        for i in range(n):
-            ang = math.radians(i * 360 / n + a0 * 0.15)
-            long = i % 5 == 0
-            r1, r2 = R * (0.92 if long else 0.945), R * 0.985
-            col = acc if (i < lit or (i + n // 2) % n < lit) else blend(C.BG, acc, 0.22)
-            c.create_line(cx + r1 * math.cos(ang), cy + r1 * math.sin(ang),
-                          cx + r2 * math.cos(ang), cy + r2 * math.sin(ang),
-                          fill=col, width=S(2) if long else 1)
+        line = blend(C.BG, C.CYAN, 0.22)
+        g = R * 1.05
+        for x1, y1, x2, y2 in ((S(8), cy, cx - g, cy), (cx + g, cy, w - S(8), cy),
+                               (cx, S(8), cx, cy - g), (cx, cy + g, cx, h - S(8))):
+            if (x2 - x1) > 4 or (y2 - y1) > 4:
+                c.create_line(x1, y1, x2, y2, fill=line, dash=(2, 4), tags="static")
+        c.create_oval(cx - R, cy - R, cx + R, cy + R, outline=blend(C.BG, C.CYAN, 0.16), tags="static")
+        for deg, lab in ((84, "000"), (-6, "090"), (264, "180"), (174, "270")):
+            a = math.radians(deg)
+            rr = R + S(13)
+            c.create_text(cx + rr * math.cos(a), cy - rr * math.sin(a), text=lab, fill=C.MUTED,
+                          font=(F_MONO, 7), tags="static")
+        gold = blend(C.BG, C.GOLD, 0.7)
+        L, m = S(26), S(6)
+        for x, y, dx, dy in ((m, m, 1, 1), (w - m, m, -1, 1), (m, h - m, 1, -1), (w - m, h - m, -1, -1)):
+            c.create_line(x, y + dy * L, x, y, x + dx * L, y, fill=gold, width=S(2), tags="static")
+        c.tag_lower("static")
 
-        # rotating arcs
-        r = R * 0.83
-        for i in range(3):
-            c.create_arc(cx - r, cy - r, cx + r, cy + r, start=a0 + i * 120, extent=72,
-                         style="arc", outline=acc, width=S(3))
-        r = R * 0.75
-        for i in range(8):
-            c.create_arc(cx - r, cy - r, cx + r, cy + r, start=-a0 * 0.7 + i * 45, extent=26,
-                         style="arc", outline=blend(C.BG, acc, 0.55), width=S(2))
-        r = R * 0.67
-        c.create_oval(cx - r, cy - r, cx + r, cy + r, outline=blend(C.BG, acc, 0.35), dash=(2, 6))
+    def _draw_reactor(self):
+        c = self.reactor
+        c.delete("dyn")
+        if not self._rg:
+            return
+        cx, cy, R, w, h, callouts = self._rg
+        draw_holo_core(c, cx, cy, R, self._accent(), self.smooth, self.angle, self.phase, self.mode, self.S)
+        if callouts:
+            self._callouts(c, cx, cy, R)
 
-        # coil segments
-        r_out, r_in = R * 0.6, R * 0.47
-        for i in range(10):
-            a = math.radians(i * 36 + 4)
-            b = math.radians(i * 36 + 32)
-            pts = [cx + r_in * math.cos(a), cy + r_in * math.sin(a),
-                   cx + r_out * math.cos(a), cy + r_out * math.sin(a),
-                   cx + r_out * math.cos(b), cy + r_out * math.sin(b),
-                   cx + r_in * math.cos(b), cy + r_in * math.sin(b)]
-            glow = 0.25 + 0.5 * lv * (0.6 + 0.4 * math.sin(self.phase * 3 + i))
-            c.create_polygon(pts, fill=blend(C.PANEL, acc, glow), outline=blend(C.BG, acc, 0.7), width=1)
-
-        # inner housing + triangle core
-        r = R * 0.4
-        c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=C.PANEL, outline=acc, width=S(2))
-        tri = []
-        for i in range(3):
-            a = math.radians(90 + i * 120)
-            tri += [cx + R * 0.3 * math.cos(a), cy + R * 0.3 * math.sin(a)]
-        c.create_polygon(tri, fill=blend(C.PANEL, acc, 0.12), outline=acc, width=S(2))
-
-        pulse = 0.5 + 0.5 * math.sin(self.phase * 1.6)
-        core = R * (0.12 + 0.05 * pulse * 0.4 + 0.08 * lv)
-        for k, t in ((1.9, 0.25), (1.45, 0.5), (1.0, 1.0)):
-            rr = core * k
-            c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, fill=blend(C.PANEL, acc, t), outline="")
-        rr = core * 0.45
-        c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, fill=C.WHITE, outline="")
-
-        # scanning arc for "think"
-        if self.mode == "think":
-            r = R * 0.9
-            c.create_arc(cx - r, cy - r, cx + r, cy + r, start=-a0 * 2, extent=40,
-                         style="arc", outline=C.WHITE, width=S(2))
+    def _callouts(self, c, cx, cy, R):
+        S = self.S
+        mic, st = self.assistant.mic, self._stats
+        if mic.muted:
+            audio = "MUTED"
+        elif mic.ok:
+            audio = f"{20 * math.log10(max(mic.level, 1e-6)):5.1f} dBFS"
+        else:
+            audio = "OFFLINE"
+        items = ((135, "AUDIO INPUT", audio),
+                 (45, "NEURAL CORE", self.cfg["ai_model"][:14].upper()),
+                 (225, "SYSTEM LOAD", f"CPU {st['CPU']:.0f} · RAM {st['RAM']:.0f}"),
+                 (315, "VOICE", self.assistant.tts.describe()[:16]))
+        lc = blend(C.BG, C.GOLD, 0.6)
+        for deg, title, val in items:
+            a = math.radians(deg)
+            sx = 1 if math.cos(a) > 0 else -1
+            sy = -1 if math.sin(a) > 0 else 1
+            px, py = cx + R * 0.97 * math.cos(a), cy - R * 0.97 * math.sin(a)
+            ex, ey = px + sx * S(18), py + sy * S(18)
+            fx = ex + sx * S(104)
+            c.create_oval(px - S(3), py - S(3), px + S(3), py + S(3), outline=lc, tags="dyn")
+            c.create_line(px, py, ex, ey, fx, ey, fill=lc, tags="dyn")
+            tx = ex + sx * S(4)
+            c.create_text(tx, ey - S(2), text=val, fill=C.WHITE, font=(F_MONO, 9), anchor="sw" if sx > 0 else "se", tags="dyn")
+            c.create_text(tx, ey + S(3), text=title, fill=C.MUTED, font=(F_HEAD, 7), anchor="nw" if sx > 0 else "ne", tags="dyn")
 
     def _draw_meter(self):
         c, S = self.meter, self.S
@@ -2469,15 +3697,14 @@ class HUD:
         n = len(self.levels)
         bw = min(S(7), (w * 0.8) / n)
         gap = bw * 0.45
-        total = n * bw
-        x0 = (w - total) / 2
+        x0 = (w - n * bw) / 2
         mid = h / 2
         for i, v in enumerate(self.levels):
             env = 0.35 + 0.65 * math.sin(math.pi * (i + 0.5) / n)
             amp = max(S(1.5), v * env * (h / 2 - S(4)))
             x = x0 + i * bw
-            col = blend(C.BG, acc, 0.35 + 0.65 * min(1, v * 1.5))
-            c.create_rectangle(x, mid - amp, x + bw - gap, mid + amp, fill=col, outline="")
+            c.create_rectangle(x, mid - amp, x + bw - gap, mid + amp,
+                               fill=blend(C.BG, acc, 0.35 + 0.65 * min(1, v * 1.5)), outline="")
 
     # ── settings ─────────────────────────────────────────────────
     def open_settings(self):
@@ -2486,20 +3713,38 @@ class HUD:
             return
         self._settings = SettingsDialog(self)
 
-    def apply_settings(self, mic_changed, tts_changed):
+    def apply_settings(self, mic_changed, tts_changed, city=None):
         save_config(self.cfg)
-        self._refresh_engine_label()
         if mic_changed:
-            self.pill_mic.set("switching…", C.AMBER)
+            self.pill_mic.set("switching…", C.GOLD)
             self.assistant.mic.reopen()
         if tts_changed:
             self.assistant.tts.reconfigure()
+        if city:
+            threading.Thread(target=self._set_city, args=(city,), daemon=True).start()
         self.set_status(self.idle_hint())
+
+    def _set_city(self, name):
+        try:
+            n, lat, lon = self.assistant.weather.geocode(name)
+            self.cfg.update(city=n, lat=lat, lon=lon)
+            save_config(self.cfg)
+            self.assistant.weather.invalidate()
+            w = self.assistant.weather.get()
+            self.post(lambda: (self.on_weather(w), self.add_system(f"location set to {n}")))
+        except Exception as e:
+            msg = f"couldn't set city '{name}': {e}"
+            self.post(lambda: self.add_system(msg))
 
     # ── quit ─────────────────────────────────────────────────────
     def quit(self):
         try:
             self.assistant.shutdown()
+        except Exception:
+            pass
+        try:
+            if self.orb is not None:
+                self.orb.destroy()
         except Exception:
             pass
         self.root.after(150, self.root.destroy)
@@ -2512,17 +3757,22 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(hud.root)
         self.hud, self.cfg, S = hud, hud.cfg, hud.S
         self.S = S
-        self.title("JARVIS — Settings")
+        self.title("J.A.R.V.I.S. — Settings")
         self.configure(bg=C.PANEL)
-        self.geometry(f"{S(560)}x{S(640)}")
-        self.minsize(S(520), S(560))
+        self.geometry(f"{S(980)}x{S(660)}")
+        self.minsize(S(900), S(600))
         self.transient(hud.root)
 
-        body = tk.Frame(self, bg=C.PANEL)
-        body.pack(fill="both", expand=True, padx=S(22), pady=S(18))
+        cols = tk.Frame(self, bg=C.PANEL)
+        cols.pack(fill="both", expand=True, padx=S(22), pady=(S(8), S(4)))
+        left = tk.Frame(cols, bg=C.PANEL)
+        right = tk.Frame(cols, bg=C.PANEL)
+        left.pack(side="left", fill="both", expand=True, padx=(0, S(14)))
+        tk.Frame(cols, bg=C.LINE, width=1).pack(side="left", fill="y", pady=S(14))
+        right.pack(side="left", fill="both", expand=True, padx=(S(14), 0))
 
         # ── Microphone ─────────────────────────────────────────
-        self._section(body, "MICROPHONE", C.GREEN)
+        self._section(left, "MICROPHONE", C.GREEN)
         self.devices = MicEngine.list_devices()
         labels = ["System default (Windows)"] + [f"{d['name']}  ·  {d['hostapi']}" for d in self.devices]
         self.dev_var = tk.StringVar(value=labels[0])
@@ -2531,67 +3781,85 @@ class SettingsDialog(tk.Toplevel):
             for d, l in zip(self.devices, labels[1:]):
                 if d["name"] == want.get("name") and d["hostapi"] == want.get("hostapi"):
                     self.dev_var.set(l)
-        row = tk.Frame(body, bg=C.PANEL)
+        row = tk.Frame(left, bg=C.PANEL)
         row.pack(fill="x", pady=(0, S(6)))
-        self.dev_box = ttk.Combobox(row, textvariable=self.dev_var, values=labels, state="readonly",
-                                    style="J.TCombobox", font=(F_BODY, 9))
-        self.dev_box.pack(side="left", fill="x", expand=True)
+        ttk.Combobox(row, textvariable=self.dev_var, values=labels, state="readonly", style="J.TCombobox",
+                     font=(F_BODY, 9)).pack(side="left", fill="x", expand=True)
         FlatButton(row, "Apply", self._apply_device, padx=S(12), pady=S(5)).pack(side="left", padx=(S(6), 0))
-        tk.Label(body, text="Tip: Bluetooth headsets usually work best via 'MME' or 'Windows DirectSound'.",
+        tk.Label(left, text="Tip: Bluetooth headsets usually work best via 'MME' or 'Windows DirectSound'.",
                  font=(F_BODY, 8), fg=C.MUTED, bg=C.PANEL, anchor="w").pack(fill="x")
-
-        self.meter = tk.Canvas(body, height=S(22), bg=C.PANEL2, highlightthickness=0)
+        self.meter = tk.Canvas(left, height=S(22), bg=C.PANEL2, highlightthickness=0)
         self.meter.pack(fill="x", pady=(S(10), S(2)))
-        self.meter_lbl = tk.Label(body, text="", font=(F_MONO, 8), fg=C.MUTED, bg=C.PANEL, anchor="w")
+        self.meter_lbl = tk.Label(left, text="", font=(F_MONO, 8), fg=C.MUTED, bg=C.PANEL, anchor="w")
         self.meter_lbl.pack(fill="x")
-
         self.sens = tk.IntVar(value=int(self.cfg.get("mic_sensitivity", 6)))
-        self._scale(body, "Sensitivity  (higher = picks up quieter speech)", self.sens, 1, 10)
-
+        self._scale(left, "Sensitivity  (higher = picks up quieter speech)", self.sens, 1, 10)
         self.wake = tk.BooleanVar(value=self.cfg.get("wake_word_enabled", True))
-        self._check(body, 'Require wake word "Jarvis"  (off = every phrase is a command)', self.wake)
-
-        tk.Label(body, text="Wake words (comma separated — add how Google mishears 'Jarvis')",
+        self._check(left, 'Require wake word "Jarvis"  (off = every phrase is a command)', self.wake)
+        tk.Label(left, text="Wake words (comma separated — add how Google mishears 'Jarvis')",
                  font=(F_BODY, 8), fg=C.SOFT, bg=C.PANEL, anchor="w").pack(fill="x", pady=(S(8), S(2)))
-        self.wake_words = tk.Entry(body, bg=C.PANEL2, fg=C.TEXT, insertbackground=C.CYAN, bd=0, highlightthickness=0,
-                                   font=(F_BODY, 9))
+        self.wake_words = tk.Entry(left, bg=C.PANEL2, fg=C.TEXT, insertbackground=C.CYAN, bd=0,
+                                   highlightthickness=0, font=(F_BODY, 9))
         self.wake_words.insert(0, ", ".join(self.cfg.get("wake_words", [])))
         self.wake_words.pack(fill="x", ipady=S(5))
-
-        row = tk.Frame(body, bg=C.PANEL)
-        row.pack(fill="x", pady=(S(8), 0))
+        row = tk.Frame(left, bg=C.PANEL)
+        row.pack(fill="x", pady=(S(10), 0))
         tk.Label(row, text="Speech language", font=(F_BODY, 9), fg=C.SOFT, bg=C.PANEL).pack(side="left")
         self.lang = tk.StringVar(value=self.cfg.get("stt_language", "en-US"))
         ttk.Combobox(row, textvariable=self.lang, values=self.LANGS, width=8, style="J.TCombobox",
                      font=(F_BODY, 9)).pack(side="right")
 
-        # ── Voice ──────────────────────────────────────────────
-        self._section(body, "VOICE", C.CYAN)
-        voices = ["Auto"] + list(hud.assistant.tts.voices)
-        self.voice = tk.StringVar(value=self.cfg.get("tts_voice") or "Auto")
-        row = tk.Frame(body, bg=C.PANEL)
-        row.pack(fill="x")
-        ttk.Combobox(row, textvariable=self.voice, values=voices, state="readonly", style="J.TCombobox",
-                     font=(F_BODY, 9)).pack(side="left", fill="x", expand=True)
-        FlatButton(row, "Test", self._test_voice, padx=S(12), pady=S(5)).pack(side="left", padx=(S(6), 0))
-        self.rate = tk.IntVar(value=int(self.cfg.get("tts_rate", 0)))
-        self._scale(body, "Speaking speed", self.rate, -5, 5)
-        self.speak = tk.BooleanVar(value=self.cfg.get("speak_replies", True))
-        self._check(body, "Speak replies aloud", self.speak)
+        self._section(left, "AI MODELS  (Ollama)", C.ORANGE)
+        self.model = self._entry_row(left, "Chat model", self.cfg["ai_model"])
+        self.vmodel = self._entry_row(left, "Vision model", self.cfg["vision_model"])
 
-        # ── AI ─────────────────────────────────────────────────
-        self._section(body, "AI MODELS  (Ollama)", C.AMBER)
-        self.model = self._entry_row(body, "Chat model", self.cfg["ai_model"])
-        self.vmodel = self._entry_row(body, "Vision model", self.cfg["vision_model"])
+        # ── Voice ──────────────────────────────────────────────
+        self._section(right, "VOICE", C.CYAN)
+        self.engine = tk.StringVar(value=self.cfg.get("voice_engine", "neural"))
+        row = tk.Frame(right, bg=C.PANEL)
+        row.pack(fill="x")
+        for text, val in (("Neural British voice (online)", "neural"), ("Windows voice (offline)", "sapi")):
+            tk.Radiobutton(row, text=text, variable=self.engine, value=val, bg=C.PANEL, fg=C.TEXT,
+                           selectcolor=C.PANEL2, activebackground=C.PANEL, activeforeground=C.WHITE,
+                           font=(F_BODY, 9), bd=0, highlightthickness=0).pack(side="left", padx=(0, S(12)))
+        if not HAS_EDGE:
+            tk.Label(right, text="edge-tts not installed → run:  pip install edge-tts", font=(F_BODY, 8),
+                     fg=C.RED, bg=C.PANEL, anchor="w").pack(fill="x", pady=(S(4), 0))
+        self.nvoice = tk.StringVar(value=self.cfg.get("neural_voice") or "en-GB-RyanNeural")
+        self._combo_row(right, "Neural voice", self.nvoice, NEURAL_VOICES)
+        self.voice = tk.StringVar(value=self.cfg.get("tts_voice") or "Auto")
+        self._combo_row(right, "Windows voice", self.voice, ["Auto"] + list(hud.assistant.tts.voices))
+        self.rate = tk.IntVar(value=int(self.cfg.get("tts_rate", 0)))
+        self._scale(right, "Speaking speed", self.rate, -5, 5)
+        row = tk.Frame(right, bg=C.PANEL)
+        row.pack(fill="x", pady=(S(4), 0))
+        self.speak = tk.BooleanVar(value=self.cfg.get("speak_replies", True))
+        tk.Checkbutton(row, text="Speak replies aloud", variable=self.speak, bg=C.PANEL, fg=C.TEXT,
+                       selectcolor=C.PANEL2, activebackground=C.PANEL, activeforeground=C.WHITE,
+                       font=(F_BODY, 9), bd=0, highlightthickness=0).pack(side="left")
+        FlatButton(row, "Test voice", self._test_voice, padx=S(12), pady=S(5)).pack(side="right")
+
+        self._section(right, "PERSONALITY & ENVIRONMENT", C.GOLD)
+        self.e_title = self._entry_row(right, "Address me as", self.cfg.get("user_title", "sir"))
+        self.e_city = self._entry_row(right, "City (weather)", self.cfg.get("city", ""))
+        self.proactive = tk.BooleanVar(value=self.cfg.get("proactive_alerts", True))
+        self._check(right, "Proactive alerts (battery, CPU / RAM load, late-night reminders)", self.proactive)
+        self.fx = tk.BooleanVar(value=self.cfg.get("sound_fx", True))
+        self._check(right, "Interface sound effects", self.fx)
+        self.bootseq = tk.BooleanVar(value=self.cfg.get("boot_sequence", True))
+        self._check(right, "Boot sequence on start-up", self.bootseq)
+        tk.Label(right, text=f"Protocols are edited in {CONFIG_FILE.name}  (\"protocols\": name → list of commands)",
+                 font=(F_BODY, 8), fg=C.MUTED, bg=C.PANEL, anchor="w").pack(fill="x", pady=(S(8), 0))
 
         btns = tk.Frame(self, bg=C.PANEL)
-        btns.pack(fill="x", padx=S(22), pady=(0, S(18)))
+        btns.pack(fill="x", padx=S(22), pady=(S(4), S(18)))
         FlatButton(btns, "SAVE", self._save, bg=C.CYAN, fg=C.BG, hover=C.CYAN_HI,
                    font=(F_HEAD, 9, "bold"), padx=S(22), pady=S(8)).pack(side="right")
         FlatButton(btns, "Close", self.destroy, padx=S(16), pady=S(8)).pack(side="right", padx=S(8))
         FlatButton(btns, "Open log", lambda: os.startfile(str(LOG_FILE)) if LOG_FILE.exists() else None,
                    padx=S(12), pady=S(8)).pack(side="left")
-
+        FlatButton(btns, "Open config", lambda: os.startfile(str(CONFIG_FILE)) if CONFIG_FILE.exists() else None,
+                   padx=S(12), pady=S(8)).pack(side="left", padx=S(8))
         self._tick()
 
     # helpers
@@ -2618,11 +3886,19 @@ class SettingsDialog(tk.Toplevel):
         S = self.S
         row = tk.Frame(parent, bg=C.PANEL)
         row.pack(fill="x", pady=S(3))
-        tk.Label(row, text=label, font=(F_BODY, 9), fg=C.SOFT, bg=C.PANEL, width=12, anchor="w").pack(side="left")
+        tk.Label(row, text=label, font=(F_BODY, 9), fg=C.SOFT, bg=C.PANEL, width=13, anchor="w").pack(side="left")
         e = tk.Entry(row, bg=C.PANEL2, fg=C.TEXT, insertbackground=C.CYAN, bd=0, highlightthickness=0, font=(F_BODY, 9))
         e.insert(0, value)
         e.pack(side="left", fill="x", expand=True, ipady=S(5))
         return e
+
+    def _combo_row(self, parent, label, var, values):
+        S = self.S
+        row = tk.Frame(parent, bg=C.PANEL)
+        row.pack(fill="x", pady=(S(8), 0))
+        tk.Label(row, text=label, font=(F_BODY, 9), fg=C.SOFT, bg=C.PANEL, width=13, anchor="w").pack(side="left")
+        ttk.Combobox(row, textvariable=var, values=values, state="readonly", style="J.TCombobox",
+                     font=(F_BODY, 9)).pack(side="left", fill="x", expand=True)
 
     def _selected_device(self):
         lbl = self.dev_var.get()
@@ -2635,11 +3911,18 @@ class SettingsDialog(tk.Toplevel):
         self.cfg["mic_device"] = self._selected_device()
         self.hud.apply_settings(mic_changed=True, tts_changed=False)
 
-    def _test_voice(self):
+    def _voice_fields(self):
+        self.cfg["voice_engine"] = self.engine.get()
+        self.cfg["neural_voice"] = self.nvoice.get()
         self.cfg["tts_voice"] = "" if self.voice.get() == "Auto" else self.voice.get()
-        self.cfg["tts_rate"] = self.rate.get()
-        self.hud.assistant.tts.reconfigure()
-        self.hud.assistant.tts.speak("Good evening, sir. All systems are operational.")
+        self.cfg["tts_rate"] = int(self.rate.get())
+
+    def _test_voice(self):
+        self._voice_fields()
+        tts = self.hud.assistant.tts
+        tts.reconfigure()
+        t = self.e_title.get().strip() or "sir"
+        tts.speak(f"Good {daypart()}, {t}. All systems are operational.")
 
     def _tick(self):
         if not self.winfo_exists():
@@ -2650,32 +3933,37 @@ class SettingsDialog(tk.Toplevel):
         w = max(c.winfo_width(), 100)
         h = S(22)
         lv = level_norm(mic.level) if mic.ok else 0
-        start_th, _ = mic._thresholds() if mic.ok else (0.01, 0)
+        start_th = mic._thresholds()[0] if mic.ok else 0.01
         th = level_norm(start_th)
-        col = C.GREEN if lv >= th else C.CYAN
-        c.create_rectangle(0, 0, w * lv, h, fill=col, outline="")
-        c.create_line(w * th, 0, w * th, h, fill=C.AMBER, width=S(2))
+        c.create_rectangle(0, 0, w * lv, h, fill=C.GREEN if lv >= th else C.CYAN, outline="")
+        c.create_line(w * th, 0, w * th, h, fill=C.GOLD, width=S(2))
         db = 20 * math.log10(max(mic.level, 1e-6))
-        self.meter_lbl.config(text=(f"level {db:5.1f} dBFS   ·   trigger at {20 * math.log10(max(start_th, 1e-6)):5.1f} dBFS"
-                                    f"   ·   {mic.device_label}" if mic.ok else "mic not open"))
+        self.meter_lbl.config(text=(f"level {db:5.1f} dBFS  ·  trigger {20 * math.log10(max(start_th, 1e-6)):5.1f} dBFS"
+                                    f"  ·  {mic.device_label}" if mic.ok else "mic not open"))
         self.after(50, self._tick)
 
     def _save(self):
         old_dev = self.cfg.get("mic_device")
+        old_tts = tuple(self.cfg.get(k) for k in ("voice_engine", "neural_voice", "tts_voice", "tts_rate"))
         self.cfg["mic_device"] = self._selected_device()
         self.cfg["mic_sensitivity"] = int(self.sens.get())
         self.cfg["wake_word_enabled"] = bool(self.wake.get())
         ww = [w.strip().lower() for w in self.wake_words.get().split(",") if w.strip()]
         self.cfg["wake_words"] = ww or ["jarvis"]
         self.cfg["stt_language"] = self.lang.get().strip() or "en-US"
-        old_tts = (self.cfg.get("tts_voice"), self.cfg.get("tts_rate"))
-        self.cfg["tts_voice"] = "" if self.voice.get() == "Auto" else self.voice.get()
-        self.cfg["tts_rate"] = int(self.rate.get())
+        self._voice_fields()
         self.cfg["speak_replies"] = bool(self.speak.get())
+        self.cfg["user_title"] = self.e_title.get().strip() or "sir"
+        self.cfg["proactive_alerts"] = bool(self.proactive.get())
+        self.cfg["sound_fx"] = bool(self.fx.get())
+        self.cfg["boot_sequence"] = bool(self.bootseq.get())
         self.cfg["ai_model"] = self.model.get().strip() or DEFAULT_CONFIG["ai_model"]
         self.cfg["vision_model"] = self.vmodel.get().strip() or DEFAULT_CONFIG["vision_model"]
+        new_city = self.e_city.get().strip()
+        city = new_city if new_city and new_city.lower() != (self.cfg.get("city") or "").lower() else None
+        new_tts = tuple(self.cfg.get(k) for k in ("voice_engine", "neural_voice", "tts_voice", "tts_rate"))
         self.hud.apply_settings(mic_changed=(old_dev != self.cfg["mic_device"]),
-                                tts_changed=(old_tts != (self.cfg["tts_voice"], self.cfg["tts_rate"])))
+                                tts_changed=(old_tts != new_tts), city=city)
         self.hud.add_system("settings saved")
         self.destroy()
 
@@ -2689,7 +3977,7 @@ def main():
     log(f"===== J.A.R.V.I.S. v{VERSION} starting (Python {sys.version.split()[0]}) =====")
     if IS_WIN:
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)        # crisp text on HiDPI
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             try:
                 ctypes.windll.user32.SetProcessDPIAware()

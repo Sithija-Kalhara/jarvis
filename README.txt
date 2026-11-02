@@ -1,61 +1,70 @@
 =====================================================
-  J.A.R.V.I.S.  Desktop Assistant  v4.0
-  Wake word + push-to-talk | Ollama AI | PC control
+  J.A.R.V.I.S.  Personal AI System  v5.0
+  Holographic HUD | British neural voice | Ollama AI
 =====================================================
 
-FILES
------
-  JARVIS_FULL.py      Main app (single file)
-  requirements.txt    Python packages
-  SETUP_AND_RUN.bat   Install packages + start Ollama + run
-  BUILD_EXE.bat       Build JARVIS.exe onto your Desktop
-
-  Created at runtime (next to the script / EXE):
-  jarvis_config.json  Your settings (mic device, sensitivity, voice, models)
-  jarvis_memory.json  Conversation history
-  jarvis.log          Log — check this first if the mic misbehaves
-
-REQUIREMENTS
+SETUP (once)
 ------------
-  - Python 3.10+  (3.12 / 3.14 fine)
-  - Ollama:  ollama serve
-             ollama pull qwen2.5:7b
-             ollama pull llava:latest
-  - Internet (speech recognition uses Google STT)
-  - A microphone
+  pip install -r requirements.txt
+  ollama pull qwen2.5:7b
+  ollama pull llava:latest
+
+RUN
+---
+  ollama serve            (or SETUP_AND_RUN.bat)
+  python JARVIS_FULL.py   (or BUILD_EXE.bat → JARVIS.exe on Desktop)
 
 TALKING TO JARVIS
 -----------------
-  "Jarvis open chrome"          wake word + command in one go
-  "Jarvis"  ...  "Yes, sir?"  ... "open chrome"
-  Mic button / F2               talk without the wake word
-  Esc / STOP / "Jarvis stop"    stop speaking
-  MUTE MIC                      pause listening (typing still works)
+  "Jarvis, open chrome"         wake word + command
+  "Jarvis" … "Yes, sir?" …      then the command
+  Click the core / F2           talk without the wake word
+  Ctrl+Alt+J                    talk from ANY app (global hotkey)
+  Esc / STOP / "stop"           stop speaking
+  F11 / ◈ HOLO / "go holographic"
+                                floating transparent orb, always on top
+                                click = talk, double-click = full HUD,
+                                drag = move, right-click = menu
 
-MIC NOT WORKING? (Settings ⚙)
------------------------------
-  1. Pick your device. Bluetooth headsets (e.g. WH-1000XM4):
-     try the "MME" entry first, then "Windows DirectSound".
-  2. Speak and watch the live meter. It must cross the amber line.
-     Not crossing  -> raise Sensitivity.
-     Always green  -> lower Sensitivity (noisy room).
-  3. Google keeps mishearing "Jarvis"? Add what it hears
-     (shown under the reactor as  heard: "..." ) to Wake words.
-  4. Or untick "Require wake word" for always-listening mode.
+JARVIS FEATURES
+---------------
+  Boot sequence        real start-up checks (AI, mic, voice, weather)
+  Greeting             time-of-day + weather on start
+  "daily briefing"     time, weather, system status, timers
+  Weather              "what's the weather" · "will it rain today"
+                       "weather in Tokyo"   (city set in Settings)
+  Timers               "set a timer for 10 minutes"
+                       "set a 5 minute timer for pasta"
+                       "how much time is left" · "cancel all timers"
+  Reminders            "remind me in 20 minutes to stretch"
+                       "remind me to call mom in an hour"
+  Protocols            "activate work protocol" · "gaming mode"
+                       "focus mode" · "list protocols"
+                       Edit them in jarvis_config.json:
+                         "protocols": { "work": ["open vs code", ...] }
+  Proactive alerts     low battery, CPU/RAM overload, late-night nudge
+  Voice                Neural British voice (en-GB-RyanNeural, needs
+                       internet) — falls back to Windows voice offline
+  Small talk           "you up?" · "thank you" · "who are you" · "help"
 
-COMMANDS (examples)
--------------------
+PC COMMANDS (examples)
+----------------------
   APPS     open spotify · close chrome · switch to notepad · minimize all
   FILES    open downloads · open folder C:\Projects · create folder test
-           find file report · list files in documents
-  SYSTEM   system status · set volume to 40 · volume up · mute
-           brightness 70 · lock · restart · shut down the computer
-           cancel shutdown · sleep · take a screenshot
+  SYSTEM   system status · set volume to 40 · mute · brightness 70
+           lock · restart · shut down the computer · cancel shutdown
   BROWSER  search for python tutorial · play lofi on youtube
-           go to github.com · new tab · close tab · go back
-  NETWORK  what is my ip · wifi off · show wifi networks · ping google.com
-  KEYS     press ctrl shift esc · type hello world · scroll down · next track
-  VISION   what's on my screen · analyze the screen
-  AI       anything else → Ollama (e.g. "explain recursion")
-  MISC     what time is it · clear history · goodbye
+           go to github.com · new tab · go back
+  NETWORK  what is my ip · wifi off · ping google.com
+  KEYS     press ctrl shift esc · type hello world · next track
+  VISION   what's on my screen
+  AI       anything else → Ollama, spoken sentence-by-sentence
+
+MIC NOT WORKING?  (Settings ⚙)
+-----------------------------
+  1. Pick your device. Bluetooth headsets (e.g. WH-1000XM4): try the
+     "MME" entry first, then "Windows DirectSound".
+  2. Speak and watch the live meter — it must cross the gold line.
+  3. Google mishears "Jarvis"? Add what it hears to Wake words.
+  4. Check jarvis.log (Settings → Open log).
 =====================================================

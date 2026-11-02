@@ -1,6 +1,7 @@
 SpeechRecognition>=3.10
 sounddevice>=0.4.6
 numpy
+edge-tts>=6.1
 pyttsx3
 comtypes
 pycaw
