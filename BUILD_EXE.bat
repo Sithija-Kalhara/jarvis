@@ -24,6 +24,8 @@ pyinstaller --noconfirm --onefile --noconsole --name "JARVIS" %ICON% ^
     --collect-data speech_recognition ^
     --collect-all sounddevice ^
     --collect-all edge_tts ^
+    --collect-all openwakeword ^
+    --collect-all onnxruntime ^
     --collect-data certifi ^
     --collect-submodules comtypes ^
     --collect-submodules pycaw ^

@@ -116,6 +116,8 @@ DEFAULT_CONFIG = {
     "wake_word_enabled": True,
     "wake_words":        ["jarvis", "jarvice", "javis", "jervis", "jarves",
                           "jarvas", "jarvish", "charvis", "jar vis", "travis"],
+    "wake_engine":       "auto",        # auto = offline "Hey Jarvis" (openWakeWord) if installed, else google
+    "wake_threshold":    0.5,
     "mic_device":        None,          # {"name": ..., "hostapi": ...}  None = Windows default
     "mic_sensitivity":   6,             # 1 (needs loud voice) … 10 (very sensitive)
     "stt_language":      "en-US",
@@ -1484,6 +1486,14 @@ class MicEngine:
         self._restart = threading.Event()
         self._last_data = time.monotonic()
         self._rec = sr.Recognizer() if HAS_SR else None
+        self._oww = None
+        self._oww_key = None
+        self._oww_failed = False
+        self._announced = None
+
+    @property
+    def wake_engine(self):
+        return "offline" if (self._oww is not None and self.cfg.get("wake_engine", "auto") != "google") else "google"
 
     # -- public --------------------------------------------------------
     def start(self):
@@ -1764,6 +1774,90 @@ class MicEngine:
                 return " ".join(out)
         return None
 
+    # -- offline wake word ("Hey Jarvis", openWakeWord) -----------------------
+    WAKE_FILES = ("hey_jarvis_v0.1.onnx", "melspectrogram.onnx", "embedding_model.onnx")
+
+    def _init_offline_wake(self):
+        if self.cfg.get("wake_engine", "auto") == "google":
+            return False
+        if self._oww is not None:
+            return True
+        if self._oww_failed:
+            return False
+        try:
+            from openwakeword.model import Model
+            import openwakeword.utils as owu
+        except Exception as e:
+            log(f"offline wake word unavailable ({e}) → pip install openwakeword onnxruntime. Using Google.")
+            self._oww_failed = True
+            return False
+        d = APP_DIR / "wakeword"
+        try:
+            if not all((d / f).exists() for f in self.WAKE_FILES):
+                log("downloading 'Hey Jarvis' wake-word model (one time, ~10 MB)…")
+                owu.download_models(["hey_jarvis"], target_directory=str(d))
+            self._oww = Model(wakeword_models=[str(d / self.WAKE_FILES[0])], inference_framework="onnx",
+                              melspec_model_path=str(d / self.WAKE_FILES[1]),
+                              embedding_model_path=str(d / self.WAKE_FILES[2]))
+            self._oww_key = next(iter(self._oww.models))
+            log("wake engine: offline 'Hey Jarvis' (openWakeWord)")
+            return True
+        except Exception as e:
+            log(f"offline wake word failed ({e}) → using Google")
+            self._oww = None
+            self._oww_failed = True
+            return False
+
+    def _wait_wake(self):
+        """Listen locally for "Hey Jarvis". Nothing leaves the PC until it is heard."""
+        m = self._oww
+        m.reset()
+        buf = np.zeros(0, dtype=np.int16)
+        thr = float(self.cfg.get("wake_threshold", 0.5))
+        while self._running:
+            if self._restart.is_set():
+                return "RESTART"
+            if self._force.is_set():
+                return "FORCE"
+            if self._paused():
+                return "PAUSED"
+            try:
+                blk = self._q.get(timeout=0.5)
+            except queue.Empty:
+                if time.monotonic() - self._last_data > 3.0:
+                    log("mic watchdog: no audio for 3 s → reopening")
+                    self._restart.set()
+                continue
+            rms = float(np.sqrt(np.mean(blk * blk)) + 1e-9)
+            a = 0.10 if rms < self.noise else 0.004
+            self.noise = (1 - a) * self.noise + a * rms
+            x = blk
+            if self._fs != self.FS:
+                n = int(len(x) * self.FS / self._fs)
+                x = np.interp(np.linspace(0, len(x) - 1, n), np.arange(len(x)), x)
+            buf = np.concatenate([buf, (np.clip(x, -1, 1) * 32767).astype(np.int16)])
+            while len(buf) >= 1280:
+                frame, buf = buf[:1280], buf[1280:]
+                score = float(m.predict(frame)[self._oww_key])
+                if score >= thr:
+                    log(f"wake word heard (score {score:.2f})")
+                    m.reset()
+                    return "WAKE"
+        return "STOP"
+
+    def _strip_wake(self, text):
+        import difflib
+        toks = text.split()
+        wake = {w.lower() for w in self.cfg.get("wake_words", [])}
+        while toks:
+            t = toks[0].lower().strip(",.!?'")
+            if (t in ("hey", "hi", "ok", "okay", "hay", "a", "yo") or t in wake
+                    or difflib.SequenceMatcher(None, t, "jarvis").ratio() >= 0.6):
+                toks.pop(0)
+            else:
+                break
+        return " ".join(toks).strip(" ,.!?")
+
     # -- main loop -----------------------------------------------------
     def _loop(self):
         state = "wake"
@@ -1802,6 +1896,34 @@ class MicEngine:
                 continue
 
             need_wake = state == "wake" and self.cfg.get("wake_word_enabled", True)
+            if need_wake and self._init_offline_wake():
+                if self._announced != "offline":
+                    self._announced = "offline"
+                    self.ev("wake_engine", "offline")
+                r = self._wait_wake()
+                if r != "WAKE":
+                    continue
+                self.ev("detected", None)
+                # said in one breath ("Hey Jarvis, open chrome")? → capture it straight away
+                res = self._capture(max_wait=0.8, max_len=14.0, allow_force=False)
+                if isinstance(res, str):
+                    continue
+                cmd = ""
+                if res is not None:
+                    self.ev("recognizing", None)
+                    alts = self._stt(res)
+                    if alts:
+                        log(f"heard: {alts[0]!r}")
+                        cmd = self._strip_wake(alts[0])
+                if cmd:
+                    self.ev("command", cmd)
+                else:
+                    state = "command"
+                    self.ev("wake", None)
+                continue
+            if need_wake and self._announced != "google":
+                self._announced = "google"
+                self.ev("wake_engine", "google")
             res = self._capture(max_wait=7.0 if state == "command" else None,
                                 max_len=9.0 if need_wake else 14.0,
                                 allow_force=(state == "wake"))
@@ -1833,7 +1955,8 @@ class MicEngine:
                     self.ev("wake", None)
             else:
                 state = "wake"
-                self.ev("command", alts[0])
+                cmd = self._strip_wake(alts[0]) if self._oww is not None else alts[0]
+                self.ev("command", cmd or alts[0])
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2411,6 +2534,10 @@ class Assistant:
             ui.post(lambda: (ui.set_flag("listening", False), ui.set_status(ui.idle_hint())))
         elif kind == "unclear":
             ui.post(lambda: (ui.set_flag("listening", False), ui.set_status(f"Didn't catch that, {self.title}.")))
+        elif kind == "detected":
+            ui.post(lambda: (ui.set_flag("listening", True), ui.set_status(f"Listening, {self.title}…")))
+        elif kind == "wake_engine":
+            ui.post(lambda: ui.on_wake_engine(payload))
         elif kind == "stt_error":
             ui.post(lambda: (ui.add_system(payload), ui.set_status("Speech service offline")))
 
@@ -3421,7 +3548,8 @@ class HUD:
         if self.flags["mic_error"]:
             return "Mic offline — type below, or pick a device in Settings."
         if self.cfg.get("wake_word_enabled", True):
-            return 'Say "Jarvis …"  ·  tap the core / F2  ·  Ctrl+Alt+J from anywhere'
+            ww = "Hey Jarvis" if self.assistant.mic.wake_engine == "offline" else "Jarvis"
+            return f'Say "{ww} …"  ·  tap the core / F2  ·  Ctrl+Alt+J from anywhere'
         return "Always listening — just speak."
 
     def set_status(self, text):
@@ -3471,6 +3599,14 @@ class HUD:
             self.boot_step("AUDIO SENSORS", self._short(label, 30).upper(), True)
         self._refresh_mode()
         if self.flags["ready"]:
+            self.set_status(self.idle_hint())
+
+    def on_wake_engine(self, engine):
+        if engine == "offline":
+            self.add_system('wake word: "Hey Jarvis" — detected offline on this PC')
+        elif self.cfg.get("wake_engine", "auto") != "google":
+            self.add_system('wake word: "Jarvis" via Google (install openwakeword for offline "Hey Jarvis")')
+        if self.flags["ready"] and not self.flags["listening"]:
             self.set_status(self.idle_hint())
 
     def on_mic_error(self, msg):
@@ -3869,8 +4005,15 @@ class SettingsDialog(tk.Toplevel):
         self.sens = tk.IntVar(value=int(self.cfg.get("mic_sensitivity", 6)))
         self._scale(left, "Sensitivity  (higher = picks up quieter speech)", self.sens, 1, 10)
         self.wake = tk.BooleanVar(value=self.cfg.get("wake_word_enabled", True))
-        self._check(left, 'Require wake word "Jarvis"  (off = every phrase is a command)', self.wake)
-        tk.Label(left, text="Wake words (comma separated — add how Google mishears 'Jarvis')",
+        self._check(left, 'Require wake word  (off = every phrase is a command)', self.wake)
+        self.wengine = tk.StringVar(value="google" if self.cfg.get("wake_engine", "auto") == "google" else "auto")
+        row = tk.Frame(left, bg=C.PANEL)
+        row.pack(fill="x", pady=(S(4), 0))
+        for text, val in (('Offline "Hey Jarvis" (recommended)', "auto"), ('Google "Jarvis"', "google")):
+            tk.Radiobutton(row, text=text, variable=self.wengine, value=val, bg=C.PANEL, fg=C.TEXT,
+                           selectcolor=C.PANEL2, activebackground=C.PANEL, activeforeground=C.WHITE,
+                           font=(F_BODY, 9), bd=0, highlightthickness=0).pack(side="left", padx=(0, S(12)))
+        tk.Label(left, text="Google wake words (comma separated — add how Google mishears 'Jarvis')",
                  font=(F_BODY, 8), fg=C.SOFT, bg=C.PANEL, anchor="w").pack(fill="x", pady=(S(8), S(2)))
         self.wake_words = tk.Entry(left, bg=C.PANEL2, fg=C.TEXT, insertbackground=C.CYAN, bd=0,
                                    highlightthickness=0, font=(F_BODY, 9))
@@ -4022,6 +4165,8 @@ class SettingsDialog(tk.Toplevel):
         self.cfg["mic_device"] = self._selected_device()
         self.cfg["mic_sensitivity"] = int(self.sens.get())
         self.cfg["wake_word_enabled"] = bool(self.wake.get())
+        wake_changed = self.cfg.get("wake_engine", "auto") != self.wengine.get()
+        self.cfg["wake_engine"] = self.wengine.get()
         ww = [w.strip().lower() for w in self.wake_words.get().split(",") if w.strip()]
         self.cfg["wake_words"] = ww or ["jarvis"]
         self.cfg["stt_language"] = self.lang.get().strip() or "en-US"
@@ -4036,7 +4181,7 @@ class SettingsDialog(tk.Toplevel):
         new_city = self.e_city.get().strip()
         city = new_city if new_city and new_city.lower() != (self.cfg.get("city") or "").lower() else None
         new_tts = tuple(self.cfg.get(k) for k in ("voice_engine", "neural_voice", "tts_voice", "tts_rate"))
-        self.hud.apply_settings(mic_changed=(old_dev != self.cfg["mic_device"]),
+        self.hud.apply_settings(mic_changed=(old_dev != self.cfg["mic_device"]) or wake_changed,
                                 tts_changed=(old_tts != new_tts), city=city)
         self.hud.add_system("settings saved")
         self.destroy()

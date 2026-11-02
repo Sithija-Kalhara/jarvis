@@ -16,8 +16,12 @@ RUN
 
 TALKING TO JARVIS
 -----------------
-  "Jarvis, open chrome"         wake word + command
-  "Jarvis" … "Yes, sir?" …      then the command
+  "Hey Jarvis, open chrome"     wake word + command, in one breath
+  "Hey Jarvis" … "Yes, sir?" …  then the command
+                                ("Hi/Okay Jarvis" also work. The wake word is
+                                detected OFFLINE on your PC — nothing is sent to
+                                Google until it hears "Hey Jarvis". First run
+                                downloads the ~10 MB model into .\wakeword)
   Click the core / F2           talk without the wake word
   Ctrl+Alt+J                    talk from ANY app (global hotkey)
   Esc / STOP / "stop"           stop speaking
@@ -65,6 +69,8 @@ MIC NOT WORKING?  (Settings ⚙)
   1. Pick your device. Bluetooth headsets (e.g. WH-1000XM4): try the
      "MME" entry first, then "Windows DirectSound".
   2. Speak and watch the live meter — it must cross the gold line.
-  3. Google mishears "Jarvis"? Add what it hears to Wake words.
+  3. "Hey Jarvis" not triggering? Speak a little louder / closer, or set
+     "wake_threshold" lower (e.g. 0.35) in jarvis_config.json.
+     No openwakeword installed → falls back to Google "Jarvis" detection.
   4. Check jarvis.log (Settings → Open log).
 =====================================================

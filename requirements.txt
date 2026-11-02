@@ -1,6 +1,8 @@
 SpeechRecognition>=3.10
 sounddevice>=0.4.6
 numpy
+openwakeword>=0.6
+onnxruntime
 edge-tts>=6.1
 pyttsx3
 comtypes
