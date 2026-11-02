@@ -1,0 +1,17 @@
+# virtual environments
+jarvis_env*/
+venv/
+.venv/
+
+# build output
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# local runtime files
+jarvis.log
+jarvis_config.json
+jarvis_memory.json
+jarvis_screen.png

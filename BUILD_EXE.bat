@@ -1,71 +1,49 @@
 @echo off
+chcp 65001 >nul
 title J.A.R.V.I.S. EXE Builder
 color 0B
+cd /d "%~dp0"
 echo.
 echo  ============================================================
-echo    Building JARVIS.exe
+echo    Building JARVIS.exe  (v4)
 echo  ============================================================
 echo.
 
-:: Install pyinstaller
-echo  [1/3] Installing PyInstaller...
-pip install pyinstaller --quiet
-echo  [✓] PyInstaller ready
+echo  [1/3] Installing requirements...
+pip install -r requirements.txt --quiet
+echo  [OK] Requirements ready
 
-:: Build
 echo.
 echo  [2/3] Building EXE (2-4 minutes, please wait)...
 echo.
 
-if exist jarvis.ico (
-    pyinstaller --onefile --noconsole --name "JARVIS" --icon=jarvis.ico ^
-        --hidden-import=speech_recognition ^
-        --hidden-import=pyttsx3 ^
-        --hidden-import=pyttsx3.drivers ^
-        --hidden-import=pyttsx3.drivers.sapi5 ^
-        --hidden-import=pyautogui ^
-        --hidden-import=pygetwindow ^
-        --hidden-import=PIL ^
-        --hidden-import=PIL.ImageGrab ^
-        --hidden-import=psutil ^
-        --hidden-import=ollama ^
-        --hidden-import=sounddevice ^
-        --hidden-import=comtypes ^
-        --hidden-import=pycaw ^
-        --hidden-import=winreg ^
-        JARVIS_FULL.py
-) else (
-    pyinstaller --onefile --noconsole --name "JARVIS" ^
-        --hidden-import=speech_recognition ^
-        --hidden-import=pyttsx3 ^
-        --hidden-import=pyttsx3.drivers ^
-        --hidden-import=pyttsx3.drivers.sapi5 ^
-        --hidden-import=pyautogui ^
-        --hidden-import=pygetwindow ^
-        --hidden-import=PIL ^
-        --hidden-import=PIL.ImageGrab ^
-        --hidden-import=psutil ^
-        --hidden-import=ollama ^
-        --hidden-import=sounddevice ^
-        --hidden-import=comtypes ^
-        --hidden-import=pycaw ^
-        --hidden-import=winreg ^
-        JARVIS_FULL.py
-)
+set ICON=
+if exist jarvis.ico set ICON=--icon=jarvis.ico
 
-:: Copy to Desktop
+pyinstaller --noconfirm --onefile --noconsole --name "JARVIS" %ICON% ^
+    --collect-data speech_recognition ^
+    --collect-all sounddevice ^
+    --collect-submodules comtypes ^
+    --collect-submodules pycaw ^
+    --hidden-import=pyttsx3.drivers ^
+    --hidden-import=pyttsx3.drivers.sapi5 ^
+    --hidden-import=pygetwindow ^
+    --hidden-import=PIL.ImageGrab ^
+    JARVIS_FULL.py
+
 echo.
 echo  [3/3] Finishing...
 if exist "dist\JARVIS.exe" (
-    copy "dist\JARVIS.exe" "%USERPROFILE%\Desktop\JARVIS.exe" /Y
+    copy "dist\JARVIS.exe" "%USERPROFILE%\Desktop\JARVIS.exe" /Y >nul
     echo.
     echo  ============================================================
-    echo   [✓] SUCCESS!  JARVIS.exe is on your Desktop
-    echo   Double-click it to launch (make sure ollama serve is running)
+    echo   [OK] SUCCESS!  JARVIS.exe is on your Desktop
+    echo   Make sure "ollama serve" is running, then double-click it.
+    echo   Settings + log are saved next to the EXE.
     echo  ============================================================
 ) else (
     echo.
-    echo  BUILD FAILED. Try running as Administrator.
+    echo  BUILD FAILED - scroll up for the PyInstaller error.
 )
 echo.
 pause
