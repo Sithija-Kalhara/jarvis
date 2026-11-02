@@ -1058,7 +1058,25 @@ class AIBrain:
                     full += piece
                     on_token(piece)
         except Exception as e:
-            err = f"My circuits hit a snag, sir — I can't reach the model ({e}). Is 'ollama serve' running?"
+            title = self.cfg.get("user_title") or "sir"
+            text = str(e)
+            if "not found" in text.lower() and not full:
+                try:
+                    _, notes = resolve_models(self.cfg)
+                except Exception:
+                    notes = []
+                if notes:
+                    log("model: " + "; ".join(notes))
+                    with self.memory._lock:                     # drop the user turn; retry re-adds it
+                        if self.memory._data["history"] and self.memory._data["history"][-1]["role"] == "user":
+                            self.memory._data["history"].pop()
+                    return self.reply_stream(user_input, on_token)
+                err = (f"The model {self.cfg['ai_model']} isn't installed, {title}. "
+                       f"Run: ollama pull qwen2.5:3b")
+            elif "connect" in text.lower() or "refused" in text.lower():
+                err = f"I can't reach Ollama, {title}. Make sure the Ollama app is running."
+            else:
+                err = f"My circuits hit a snag, {title} — {text}"
             on_token(("\n" if full else "") + err)
             full = full + ("\n" if full else "") + err
         full = full.strip() or "I'm afraid I have nothing to add, sir."
@@ -1066,21 +1084,68 @@ class AIBrain:
         return full
 
 
+VISION_HINTS = ("llava", "moondream", "vision", "bakllava", "minicpm-v", "llama3.2-vision", "granite3.2-vision")
+CHAT_PREFS = ("qwen2.5:3b", "llama3.2:3b", "qwen2.5:7b", "llama3.2", "qwen3", "gemma3", "phi3", "mistral", "llama3")
+VISION_PREFS = ("moondream", "llava-phi3", "llava:7b", "llava:latest", "llava")
+
+
+def _installed_models():
+    raw = ollama.list()
+    models = getattr(raw, "models", None)
+    if models is None and isinstance(raw, dict):
+        models = raw.get("models", [])
+    names = []
+    for m in models or []:
+        n = getattr(m, "model", None) or (m.get("model") or m.get("name") if isinstance(m, dict) else str(m))
+        if n:
+            names.append(n)
+    return names
+
+
+def _has(names, want):
+    want = (want or "").lower()
+    base = want if ":" in want else want + ":latest"
+    return any(n.lower() == want or n.lower() == base for n in names)
+
+
+def _pick(names, prefs, vision):
+    pool = [n for n in names if any(h in n.lower() for h in VISION_HINTS) == vision]
+    for p in prefs:
+        for n in pool:
+            if n.lower() == p or n.lower().startswith(p if ":" in p else p + ":"):
+                return n
+    return pool[0] if pool else None
+
+
+def resolve_models(cfg):
+    """If the configured models aren't installed, switch to installed ones.
+    Returns (installed_names, list_of_change_notes). Raises if Ollama is unreachable."""
+    names = _installed_models()
+    notes = []
+    for key, prefs, vision in (("ai_model", CHAT_PREFS, False), ("vision_model", VISION_PREFS, True)):
+        if not _has(names, cfg.get(key)):
+            alt = _pick(names, prefs, vision)
+            if alt:
+                notes.append(f"{cfg.get(key)} isn't installed → using {alt}")
+                cfg[key] = alt
+    if notes:
+        save_config(cfg)
+    return names, notes
+
+
 def check_ollama(cfg):
-    """Returns (online: bool, message: str)."""
+    """Returns (online: bool, message: str). Auto-switches to installed models."""
     if not HAS_OLLAMA:
         return False, "ollama package missing"
     try:
-        raw = ollama.list()
-        names = []
-        models = getattr(raw, "models", None)
-        if models is None and isinstance(raw, dict):
-            models = raw.get("models", [])
-        for m in models or []:
-            names.append(getattr(m, "model", None) or (m.get("name") if isinstance(m, dict) else str(m)))
-        missing = [x for x in (cfg["ai_model"], cfg["vision_model"]) if not any(x in (n or "") for n in names)]
-        if missing:
+        names, notes = resolve_models(cfg)
+        for n in notes:
+            log(f"model: {n}")
+        missing = [x for x in (cfg["ai_model"], cfg["vision_model"]) if not _has(names, x)]
+        if not _has(names, cfg["ai_model"]):
             return True, "missing: " + ", ".join(missing)
+        if missing:
+            log(f"vision model missing: {cfg['vision_model']} (ollama pull moondream)")
         return True, cfg["ai_model"]
     except Exception as e:
         return False, str(e)
@@ -1679,15 +1744,24 @@ class MicEngine:
                        key=len, reverse=True)
         for alt in alts:
             low = alt.lower()
+            m = None
             for w in words:
                 m = re.search(r"\b" + re.escape(w) + r"\b", low)
                 if m:
-                    rest = alt[m.end():].strip(" ,.!?")
-                    out = []
-                    for tok in rest.split():                 # "open open chrome" → "open chrome"
-                        if not out or tok.lower() != out[-1].lower():
-                            out.append(tok)
-                    return " ".join(out)
+                    break
+            if not m:                                   # fuzzy: "jarvas", "javiss", "jervice"…
+                import difflib
+                for tm in list(re.finditer(r"[a-z']+", low))[:3]:
+                    if difflib.SequenceMatcher(None, tm.group().strip("'"), "jarvis").ratio() >= 0.75:
+                        m = tm
+                        break
+            if m:
+                rest = alt[m.end():].strip(" ,.!?")
+                out = []
+                for tok in rest.split():                     # "open open chrome" → "open chrome"
+                    if not out or tok.lower() != out[-1].lower():
+                        out.append(tok)
+                return " ".join(out)
         return None
 
     # -- main loop -----------------------------------------------------
