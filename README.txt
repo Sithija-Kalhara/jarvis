@@ -6,8 +6,8 @@
 SETUP (once)
 ------------
   pip install -r requirements.txt
-  ollama pull qwen2.5:7b
-  ollama pull llava:latest
+  ollama pull qwen2.5:3b      (7b if you have a GPU / 32 GB RAM)
+  ollama pull moondream       (light vision model for screen scan)
 
 RUN
 ---

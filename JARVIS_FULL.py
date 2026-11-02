@@ -107,8 +107,8 @@ LOG_FILE    = APP_DIR / "jarvis.log"
 VERSION     = "5.0"
 
 DEFAULT_CONFIG = {
-    "ai_model":          "qwen2.5:7b",
-    "vision_model":      "llava:latest",
+    "ai_model":          "qwen2.5:3b",
+    "vision_model":      "moondream",
     "user_title":        "sir",
     "city":              "Oyama",
     "lat":               36.3147,
