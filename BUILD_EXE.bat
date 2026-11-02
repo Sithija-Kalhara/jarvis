@@ -5,7 +5,7 @@ color 0B
 cd /d "%~dp0"
 echo.
 echo  ============================================================
-echo    Building JARVIS.exe  (v4)
+echo    Building JARVIS.exe  (v5)
 echo  ============================================================
 echo.
 
@@ -23,6 +23,8 @@ if exist jarvis.ico set ICON=--icon=jarvis.ico
 pyinstaller --noconfirm --onefile --noconsole --name "JARVIS" %ICON% ^
     --collect-data speech_recognition ^
     --collect-all sounddevice ^
+    --collect-all edge_tts ^
+    --collect-data certifi ^
     --collect-submodules comtypes ^
     --collect-submodules pycaw ^
     --hidden-import=pyttsx3.drivers ^
